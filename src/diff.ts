@@ -67,6 +67,28 @@ export function parseDiff(raw: string): DiffLine[] {
 }
 
 /**
+ * The diff row that best corresponds to working-tree line `target`. Prefers an
+ * exact match; otherwise picks the row whose new-file line is closest, so the
+ * cursor lands near the right place even when the diff shifted under it.
+ * Returns 0 when nothing maps (e.g. an empty diff).
+ */
+export function rowForNewLine(lines: DiffLine[], target: number): number {
+  let best = -1;
+  let bestDist = Infinity;
+  for (let i = 0; i < lines.length; i++) {
+    const n = lines[i].newLine;
+    if (n === undefined) continue;
+    const dist = Math.abs(n - target);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = i;
+    }
+    if (dist === 0) break;
+  }
+  return best === -1 ? 0 : best;
+}
+
+/**
  * Best-effort working-tree line number for the row at `index`. Falls back to
  * the nearest preceding row that maps to a new-file line (e.g. when the cursor
  * sits on a deletion, we aim at the surrounding context).

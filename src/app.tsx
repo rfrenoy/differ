@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
 import {
   type ChangedFile,
@@ -7,7 +7,7 @@ import {
   listChangedFiles,
   resolveRepo,
 } from './git.js';
-import { type DiffLine, newLineAt, parseDiff } from './diff.js';
+import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
 import { openInEditor } from './editor.js';
 import { enterAltScreen, leaveAltScreen } from './screen.js';
 
@@ -94,6 +94,10 @@ export default function App() {
   const [diffCursor, setDiffCursor] = useState(0);
   const [diffTop, setDiffTop] = useState(0);
 
+  // After an editor round-trip, the working-tree line we want the diff cursor
+  // to land on. Read by the diff-load effect, then cleared.
+  const pendingCursorLine = useRef<number | null>(null);
+
   const [status, setStatus] = useState<string>('Loading…');
   const [error, setError] = useState<string | null>(null);
 
@@ -139,8 +143,13 @@ export default function App() {
       try {
         const raw = await diffForFile(selectedFile, repo.hasHead);
         if (cancelled) return;
-        setDiffLines(parseDiff(raw));
-        setDiffCursor(0);
+        const lines = parseDiff(raw);
+        setDiffLines(lines);
+        // After an editor round-trip, restore the cursor to where it was in
+        // the editor; otherwise start at the top of a freshly selected file.
+        const target = pendingCursorLine.current;
+        pendingCursorLine.current = null;
+        setDiffCursor(target === null ? 0 : rowForNewLine(lines, target));
         setDiffTop(0);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -177,19 +186,11 @@ export default function App() {
     if (!result.ok) setError(result.error ?? 'Editor failed.');
     else setError(null);
 
-    // The file (and its status) may have changed; refresh both.
-    void (async () => {
-      await reloadFiles();
-      if (repo && selectedFile) {
-        try {
-          const raw = await diffForFile(selectedFile, repo.hasHead);
-          setDiffLines(parseDiff(raw));
-          setDiffCursor((c) => c); // keep position; effect will clamp the view
-        } catch {
-          /* surfaced on next interaction */
-        }
-      }
-    })();
+    // Remember where to put the cursor: the editor's final line if we captured
+    // it, otherwise the line we jumped from. Refreshing the file list re-selects
+    // the file, and the diff-load effect repositions the cursor accordingly.
+    pendingCursorLine.current = result.cursorLine ?? line;
+    void reloadFiles();
   }, [repo, selectedFile, diffLines, diffCursor, reloadFiles, setRawMode]);
 
   useInput(

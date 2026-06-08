@@ -13,6 +13,9 @@ import { enterAltScreen, leaveAltScreen } from './screen.js';
 
 type Pane = 'files' | 'diff';
 
+/** Fixed width (in columns) of the file-list pane. The diff pane fills the rest. */
+const FILE_COL_WIDTH = 36;
+
 /** Tracks the live terminal size so panes can resize with the window. */
 function useTerminalSize(): { rows: number; columns: number } {
   const [size, setSize] = useState({
@@ -98,7 +101,6 @@ export default function App() {
 
   // Layout math: 1 row header + 1 row footer, the rest is the body.
   const bodyHeight = Math.max(3, rows - 2);
-  const fileColWidth = Math.min(42, Math.max(24, Math.floor(columns * 0.3)));
   const diffViewport = bodyHeight; // rows available inside the diff pane
 
   const reloadFiles = useCallback(async () => {
@@ -268,7 +270,8 @@ export default function App() {
       <Box height={bodyHeight}>
         <Box
           flexDirection="column"
-          width={fileColWidth}
+          width={FILE_COL_WIDTH}
+          flexShrink={0}
           borderStyle="round"
           borderColor={pane === 'files' ? 'blue' : 'gray'}
           paddingX={1}

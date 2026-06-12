@@ -84,3 +84,68 @@ export async function diffForFile(file: ChangedFile, hasHead: boolean): Promise<
     : ['--no-color', '--', file.path];
   return git.diff(args);
 }
+
+export interface CommitInfo {
+  /** The ref as the user typed it, e.g. "HEAD~3". */
+  ref: string;
+  /** Full resolved SHA. */
+  sha: string;
+  shortSha: string;
+  subject: string;
+  author: string;
+  /** False for a root commit (diff against the empty tree instead of `^`). */
+  hasParent: boolean;
+}
+
+// git's well-known empty-tree object; diffing against it yields an all-added
+// diff, which is what we want for a root commit.
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+/** Resolve a commit-ish (sha, HEAD~3, HEAD^, tag, …) to a commit, or throw. */
+export async function resolveCommit(ref: string): Promise<CommitInfo> {
+  let sha: string;
+  try {
+    // ^{commit} forces it to resolve to a commit object (not a tree/blob/tag).
+    sha = (await git.revparse([`${ref}^{commit}`])).trim();
+  } catch {
+    throw new Error(`Not a valid commit: ${ref}`);
+  }
+
+  let hasParent = true;
+  try {
+    await git.revparse([`${sha}^`]);
+  } catch {
+    hasParent = false;
+  }
+
+  // NUL-separated so subjects with unusual characters stay intact.
+  const meta = (await git.raw(['show', '-s', '--format=%h%x00%s%x00%an', sha])).trim();
+  const [shortSha = sha.slice(0, 9), subject = '', author = ''] = meta.split('\0');
+
+  return { ref, sha, shortSha, subject, author, hasParent };
+}
+
+/** Files changed by `commit` relative to its parent (or the empty tree). */
+export async function listCommitFiles(commit: CommitInfo): Promise<ChangedFile[]> {
+  const base = commit.hasParent ? `${commit.sha}^` : EMPTY_TREE;
+  const raw = await git.raw(['diff', '--name-status', '--no-renames', base, commit.sha]);
+
+  const files: ChangedFile[] = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    const tab = line.indexOf('\t');
+    if (tab === -1) continue;
+    const letter = line[0];
+    const path = line.slice(tab + 1).trim();
+    const kind: ChangeKind =
+      letter === 'A' ? 'added' : letter === 'D' ? 'deleted' : 'modified';
+    files.push({ path, kind, untracked: false, code: letter });
+  }
+  return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/** Unified diff for one file as introduced by `commit`. */
+export async function diffForCommitFile(commit: CommitInfo, file: ChangedFile): Promise<string> {
+  const base = commit.hasParent ? `${commit.sha}^` : EMPTY_TREE;
+  return git.diff(['--no-color', base, commit.sha, '--', file.path]);
+}

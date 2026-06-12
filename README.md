@@ -31,6 +31,22 @@ node dist/cli.js
 
 Run it from inside any git repository.
 
+### Viewing a commit
+
+Pass a commit-ish to see the diff that commit introduced (relative to its
+parent, or the empty tree for a root commit):
+
+```bash
+differ HEAD        # the most recent commit
+differ HEAD^       # its parent
+differ HEAD~3      # three commits back
+differ a1b2c3d     # a specific SHA (also tags, branch names)
+```
+
+Editing still works in this mode: `e` opens the file at the commit's line
+number in your editor. Note the working-tree file may have changed since that
+commit, so the line is a best-effort landing point.
+
 ## Keys
 
 | Key            | Action                                            |

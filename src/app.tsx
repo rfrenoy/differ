@@ -2,9 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
 import {
   type ChangedFile,
+  type CommitInfo,
   type Repo,
+  diffForCommitFile,
   diffForFile,
   listChangedFiles,
+  listCommitFiles,
+  resolveCommit,
   resolveRepo,
 } from './git.js';
 import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
@@ -80,12 +84,16 @@ function DiffRow({ line, selected }: { line: DiffLine; selected: boolean }) {
   );
 }
 
-export default function App() {
+export default function App({ target }: { target?: string }) {
   const { exit } = useApp();
   const { setRawMode, isRawModeSupported } = useStdin();
   const { rows, columns } = useTerminalSize();
 
   const [repo, setRepo] = useState<Repo | null>(null);
+  // Set when differ is launched on a commit-ish; null means working-tree mode.
+  const [commit, setCommit] = useState<CommitInfo | null>(null);
+  // Mirror of `commit` for use inside stable callbacks without re-creating them.
+  const commitRef = useRef<CommitInfo | null>(null);
   const [files, setFiles] = useState<ChangedFile[]>([]);
   const [fileIdx, setFileIdx] = useState(0);
   const [pane, setPane] = useState<Pane>('files');
@@ -109,11 +117,18 @@ export default function App() {
 
   const reloadFiles = useCallback(async () => {
     try {
-      const list = await listChangedFiles();
+      const c = commitRef.current;
+      const list = c ? await listCommitFiles(c) : await listChangedFiles();
       setFiles(list);
       setFileIdx((i) => Math.min(i, Math.max(0, list.length - 1)));
       setError(null);
-      setStatus(list.length === 0 ? 'No changes — working tree clean.' : `${list.length} changed file(s)`);
+      if (c) {
+        setStatus(`${list.length} file(s) in ${c.shortSha} — ${c.subject}`);
+      } else {
+        setStatus(
+          list.length === 0 ? 'No changes — working tree clean.' : `${list.length} changed file(s)`,
+        );
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -125,12 +140,17 @@ export default function App() {
       try {
         const r = await resolveRepo();
         setRepo(r);
+        if (target) {
+          const c = await resolveCommit(target);
+          commitRef.current = c;
+          setCommit(c);
+        }
         await reloadFiles();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
     })();
-  }, [reloadFiles]);
+  }, [reloadFiles, target]);
 
   // Load the diff whenever the selected file changes.
   useEffect(() => {
@@ -141,7 +161,9 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const raw = await diffForFile(selectedFile, repo.hasHead);
+        const raw = commit
+          ? await diffForCommitFile(commit, selectedFile)
+          : await diffForFile(selectedFile, repo.hasHead);
         if (cancelled) return;
         const lines = parseDiff(raw);
         setDiffLines(lines);
@@ -158,7 +180,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [repo, selectedFile, selectedFile?.path]);
+  }, [repo, commit, selectedFile, selectedFile?.path]);
 
   // Keep the diff cursor inside the visible viewport.
   useEffect(() => {
@@ -261,10 +283,18 @@ export default function App() {
     <Box flexDirection="column" width={columns} height={rows}>
       {/* Header */}
       <Box>
-        <Text backgroundColor="blue" color="white" bold>
-          {' differ '}
+        <Text backgroundColor={commit ? 'magenta' : 'blue'} color="white" bold>
+          {commit ? ' differ · commit ' : ' differ '}
         </Text>
-        <Text> {repo ? repo.root : '…'}</Text>
+        {commit ? (
+          <Text wrap="truncate">
+            {' '}
+            <Text color="yellow">{commit.shortSha}</Text>{' '}
+            <Text dimColor>{commit.subject}</Text>
+          </Text>
+        ) : (
+          <Text> {repo ? repo.root : '…'}</Text>
+        )}
       </Box>
 
       {/* Body */}

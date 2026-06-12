@@ -17,7 +17,12 @@ export interface Repo {
   hasHead: boolean;
 }
 
-const git: SimpleGit = simpleGit();
+// Bound to the current directory at startup; re-pinned to the repo root by
+// resolveRepo so that `status` and `diff` always run from the same base.
+// Otherwise, running differ from a subdirectory makes git status report
+// root-relative paths while diff resolves them against the subdir, yielding
+// empty diffs.
+let git: SimpleGit = simpleGit();
 
 export async function resolveRepo(): Promise<Repo> {
   const isRepo = await git.checkIsRepo();
@@ -25,6 +30,8 @@ export async function resolveRepo(): Promise<Repo> {
     throw new Error('Not inside a git repository.');
   }
   const root = (await git.revparse(['--show-toplevel'])).trim();
+  // Re-pin every subsequent git command to the repo root.
+  git = simpleGit(root);
   let hasHead = true;
   try {
     await git.revparse(['HEAD']);

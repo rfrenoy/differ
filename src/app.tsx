@@ -1,16 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
-import {
-  type ChangedFile,
-  type CommitInfo,
-  type Repo,
-  diffForCommitFile,
-  diffForFile,
-  listChangedFiles,
-  listCommitFiles,
-  resolveCommit,
-  resolveRepo,
-} from './git.js';
+import { type ChangedFile, type Repo, resolveCommit, resolveRepo } from './git.js';
+import { fetchPrDiff, resolvePr } from './gh.js';
+import { type DiffSource, commitSource, prSource, worktreeSource } from './source.js';
 import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
 import { openInEditor } from './editor.js';
 import { enterAltScreen, leaveAltScreen } from './screen.js';
@@ -84,16 +76,16 @@ function DiffRow({ line, selected }: { line: DiffLine; selected: boolean }) {
   );
 }
 
-export default function App({ target }: { target?: string }) {
+export default function App({ target, pr }: { target?: string; pr?: number }) {
   const { exit } = useApp();
   const { setRawMode, isRawModeSupported } = useStdin();
   const { rows, columns } = useTerminalSize();
 
   const [repo, setRepo] = useState<Repo | null>(null);
-  // Set when differ is launched on a commit-ish; null means working-tree mode.
-  const [commit, setCommit] = useState<CommitInfo | null>(null);
-  // Mirror of `commit` for use inside stable callbacks without re-creating them.
-  const commitRef = useRef<CommitInfo | null>(null);
+  // What differ is showing: working tree, a commit, or a PR. Chosen at startup.
+  const [source, setSource] = useState<DiffSource | null>(null);
+  // Mirror of `source` for use inside stable callbacks without re-creating them.
+  const sourceRef = useRef<DiffSource | null>(null);
   const [files, setFiles] = useState<ChangedFile[]>([]);
   const [fileIdx, setFileIdx] = useState(0);
   const [pane, setPane] = useState<Pane>('files');
@@ -117,61 +109,60 @@ export default function App({ target }: { target?: string }) {
 
   const reloadFiles = useCallback(async () => {
     try {
-      const c = commitRef.current;
-      const list = c ? await listCommitFiles(c) : await listChangedFiles();
+      const src = sourceRef.current;
+      if (!src) return;
+      const list = await src.listFiles();
       setFiles(list);
       setFileIdx((i) => Math.min(i, Math.max(0, list.length - 1)));
       setError(null);
-      if (c) {
-        setStatus(`${list.length} file(s) in ${c.shortSha} — ${c.subject}`);
-      } else {
-        setStatus(
-          list.length === 0 ? 'No changes — working tree clean.' : `${list.length} changed file(s)`,
-        );
-      }
+      setStatus(src.status(list.length));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, []);
 
-  // Initial load.
+  // Initial load: resolve the repo, pick the source, then list its files.
   useEffect(() => {
     (async () => {
       try {
         const r = await resolveRepo();
         setRepo(r);
-        if (target) {
-          const c = await resolveCommit(target);
-          commitRef.current = c;
-          setCommit(c);
+        let src: DiffSource;
+        if (pr !== undefined) {
+          const [info, diffs] = await Promise.all([resolvePr(pr), fetchPrDiff(pr)]);
+          src = prSource(info, diffs);
+        } else if (target) {
+          src = commitSource(await resolveCommit(target));
+        } else {
+          src = worktreeSource(r);
         }
+        sourceRef.current = src;
+        setSource(src);
         await reloadFiles();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
     })();
-  }, [reloadFiles, target]);
+  }, [reloadFiles, target, pr]);
 
-  // Load the diff whenever the selected file changes.
+  // Load the diff whenever the selected file (or source) changes.
   useEffect(() => {
-    if (!repo || !selectedFile) {
+    if (!repo || !source || !selectedFile) {
       setDiffLines([]);
       return;
     }
     let cancelled = false;
     (async () => {
       try {
-        const raw = commit
-          ? await diffForCommitFile(commit, selectedFile)
-          : await diffForFile(selectedFile, repo.hasHead);
+        const raw = await source.loadDiff(selectedFile);
         if (cancelled) return;
         const lines = parseDiff(raw);
         setDiffLines(lines);
         // After an editor round-trip, restore the cursor to where it was in
         // the editor; otherwise start at the top of a freshly selected file.
-        const target = pendingCursorLine.current;
+        const pending = pendingCursorLine.current;
         pendingCursorLine.current = null;
-        setDiffCursor(target === null ? 0 : rowForNewLine(lines, target));
+        setDiffCursor(pending === null ? 0 : rowForNewLine(lines, pending));
         setDiffTop(0);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -180,7 +171,7 @@ export default function App({ target }: { target?: string }) {
     return () => {
       cancelled = true;
     };
-  }, [repo, commit, selectedFile, selectedFile?.path]);
+  }, [repo, source, selectedFile, selectedFile?.path]);
 
   // Keep the diff cursor inside the visible viewport.
   useEffect(() => {
@@ -230,6 +221,10 @@ export default function App({ target }: { target?: string }) {
       return;
     }
     if (input === 'e') {
+      if (!source?.editable) {
+        setStatus('Editing is off while viewing a PR — code suggestions are coming.');
+        return;
+      }
       openEditor();
       return;
     }
@@ -283,18 +278,10 @@ export default function App({ target }: { target?: string }) {
     <Box flexDirection="column" width={columns} height={rows}>
       {/* Header */}
       <Box>
-        <Text backgroundColor={commit ? 'magenta' : 'blue'} color="white" bold>
-          {commit ? ' differ · commit ' : ' differ '}
+        <Text backgroundColor={source?.header.color ?? 'blue'} color="white" bold>
+          {source?.header.badge ?? ' differ '}
         </Text>
-        {commit ? (
-          <Text wrap="truncate">
-            {' '}
-            <Text color="yellow">{commit.shortSha}</Text>{' '}
-            <Text dimColor>{commit.subject}</Text>
-          </Text>
-        ) : (
-          <Text> {repo ? repo.root : '…'}</Text>
-        )}
+        <Text wrap="truncate"> {source ? source.header.detail : '…'}</Text>
       </Box>
 
       {/* Body */}
@@ -343,8 +330,12 @@ export default function App({ target }: { target?: string }) {
       <Box>
         <Text>
           <Text color="cyan">↑↓/jk</Text> move <Text color="cyan">tab</Text> pane{' '}
-          <Text color="cyan">e</Text> edit@line <Text color="cyan">r</Text> refresh{' '}
-          <Text color="cyan">q</Text> quit
+          {source?.editable ? (
+            <Text>
+              <Text color="cyan">e</Text> edit@line{' '}
+            </Text>
+          ) : null}
+          <Text color="cyan">r</Text> refresh <Text color="cyan">q</Text> quit
         </Text>
         <Text dimColor> — {status}</Text>
       </Box>

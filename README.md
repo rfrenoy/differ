@@ -47,6 +47,20 @@ Editing still works in this mode: `e` opens the file at the commit's line
 number in your editor. Note the working-tree file may have changed since that
 commit, so the line is a best-effort landing point.
 
+### Reviewing a pull request
+
+Pass a GitHub PR number to view its aggregate (`base...head`) diff — the same
+view as GitHub's "Files changed" tab:
+
+```bash
+differ --pr 234
+```
+
+This shells out to the [GitHub CLI](https://cli.github.com) (`gh pr diff`), so
+`gh` must be installed and authenticated (`gh auth login`). It is **fetch-only**:
+your working tree and current branch are left untouched. Editing is disabled in
+this mode for now — writing comments and code suggestions is the next milestone.
+
 ## Keys
 
 | Key            | Action                                            |

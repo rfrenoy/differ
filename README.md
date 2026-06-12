@@ -63,9 +63,3 @@ differ uses `$VISUAL`, then `$EDITOR`, falling back to `nvim`. It knows the
 jump-to-line syntax for vi/vim/nvim/nano/emacs (`+LINE`), the VS Code family
 (`-g file:LINE`), Sublime (`file:LINE`), and JetBrains IDEs (`--line LINE`).
 
-## Roadmap
-
-- Stage / unstage / discard (hunks and lines)
-- Commit, amend, and a commit-message editor
-- Branches, stash, and log panes
-- Edit just the hunk (in addition to the full file)

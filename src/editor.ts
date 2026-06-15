@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -130,4 +130,43 @@ export function viewInEditor(file: string, line: number, cwd: string): OpenResul
     return { ok: false, error: `${cmd} exited with status ${result.status}` };
   }
   return { ok: true };
+}
+
+export interface EditTextResult {
+  ok: boolean;
+  text?: string;
+  error?: string;
+}
+
+/**
+ * Open the user's editor on a throwaway markdown buffer seeded with `initial`,
+ * and return the saved contents. Used to compose review comments.
+ */
+export function editTextInEditor(initial: string): EditTextResult {
+  const dir = mkdtempSync(join(tmpdir(), 'differ-comment-'));
+  const file = join(dir, 'COMMENT.md');
+  writeFileSync(file, initial, 'utf8');
+
+  const editor = resolveEditor();
+  const [cmd, ...preArgs] = editor.split(/\s+/);
+  const args = [...preArgs, ...editorArgs(editor, file, 1)];
+  const result = spawnSync(cmd, args, { stdio: 'inherit' });
+
+  let text: string | undefined;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch {
+    /* nothing saved */
+  }
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+
+  if (result.error) return { ok: false, error: `${cmd}: ${result.error.message}` };
+  if (typeof result.status === 'number' && result.status !== 0) {
+    return { ok: false, error: `${cmd} exited with status ${result.status}` };
+  }
+  return { ok: true, text };
 }

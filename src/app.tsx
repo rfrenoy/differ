@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
-import { type ChangedFile, type Repo, resolveCommit, resolveRepo } from './git.js';
+import { type ChangedFile, type Repo, gitDir, resolveCommit, resolveRepo } from './git.js';
 import { fetchPrDiff, resolvePr } from './gh.js';
 import { type DiffSource, commitSource, prSource, worktreeSource } from './source.js';
 import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
-import { openInEditor, viewInEditor } from './editor.js';
+import { editTextInEditor, openInEditor, viewInEditor } from './editor.js';
+import {
+  type DraftComment,
+  type Side,
+  anchorKey,
+  draftsPath,
+  loadDrafts,
+  saveDrafts,
+} from './comments.js';
 import { join } from 'node:path';
 import { enterAltScreen, leaveAltScreen } from './screen.js';
 
@@ -38,7 +46,17 @@ const STATUS_COLOR: Record<ChangedFile['kind'], string> = {
   untracked: 'cyan',
 };
 
-function FileRow({ file, active, selected }: { file: ChangedFile; active: boolean; selected: boolean }) {
+function FileRow({
+  file,
+  active,
+  selected,
+  comments,
+}: {
+  file: ChangedFile;
+  active: boolean;
+  selected: boolean;
+  comments: number;
+}) {
   const marker = file.code.replace(/ /g, '·');
   return (
     <Text
@@ -48,11 +66,12 @@ function FileRow({ file, active, selected }: { file: ChangedFile; active: boolea
       color={selected && !active ? 'white' : undefined}
     >
       <Text color={STATUS_COLOR[file.kind]}>{marker}</Text> {file.path}
+      {comments > 0 ? <Text color="yellow"> ●{comments}</Text> : null}
     </Text>
   );
 }
 
-function DiffRow({ line, selected }: { line: DiffLine; selected: boolean }) {
+function DiffRow({ line, selected, gutter }: { line: DiffLine; selected: boolean; gutter?: string }) {
   let color: string | undefined;
   let dimColor = false;
   switch (line.type) {
@@ -71,10 +90,51 @@ function DiffRow({ line, selected }: { line: DiffLine; selected: boolean }) {
       break;
   }
   return (
-    <Text wrap="truncate" color={color} dimColor={dimColor} inverse={selected}>
-      {line.text.length > 0 ? line.text : ' '}
+    <Text wrap="truncate" inverse={selected}>
+      {gutter !== undefined ? <Text color="yellow">{gutter}</Text> : null}
+      <Text color={color} dimColor={dimColor}>
+        {line.text.length > 0 ? line.text : ' '}
+      </Text>
     </Text>
   );
+}
+
+/** A single rendered line within a comment block shown under a diff line. */
+function CommentRow({ text, meta }: { text: string; meta: boolean }) {
+  return (
+    <Text wrap="truncate" color={meta ? undefined : 'yellow'} dimColor={meta}>
+      {text.length > 0 ? text : ' '}
+    </Text>
+  );
+}
+
+/**
+ * What actually gets drawn in the diff pane: each diff line, optionally
+ * followed by the rendered lines of a comment anchored to it.
+ */
+type RenderRow =
+  | { kind: 'diff'; diffIndex: number; line: DiffLine; commented: boolean }
+  | { kind: 'comment'; diffIndex: number; text: string; meta: boolean };
+
+/** The comment anchor (side + file line) a diff row maps to, if any. */
+function anchorForLine(line: DiffLine): { side: Side; line: number } | null {
+  if (line.type === 'del') {
+    return line.oldLine === undefined ? null : { side: 'LEFT', line: line.oldLine };
+  }
+  if (line.type === 'add' || line.type === 'context') {
+    return line.newLine === undefined ? null : { side: 'RIGHT', line: line.newLine };
+  }
+  return null;
+}
+
+/** Render a draft comment as indented lines beneath its diff line. */
+function commentBlock(diffIndex: number, c: DraftComment): RenderRow[] {
+  const rows: RenderRow[] = [{ kind: 'comment', diffIndex, text: '    ┌ you (draft)', meta: true }];
+  for (const b of c.body.split('\n')) {
+    rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false });
+  }
+  rows.push({ kind: 'comment', diffIndex, text: '    └ c edit · d delete', meta: true });
+  return rows;
 }
 
 export default function App({ target, pr }: { target?: string; pr?: number }) {
@@ -93,7 +153,13 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
 
   const [diffLines, setDiffLines] = useState<DiffLine[]>([]);
   const [diffCursor, setDiffCursor] = useState(0);
-  const [diffTop, setDiffTop] = useState(0);
+  // Scroll offset into the rendered rows (diff lines + inline comment blocks).
+  const [renderTop, setRenderTop] = useState(0);
+
+  // Draft review comments (PR mode), persisted to .git/differ/pr-<n>.json.
+  const [comments, setComments] = useState<DraftComment[]>([]);
+  const draftsFileRef = useRef<string | null>(null);
+  const headShaRef = useRef<string | null>(null);
 
   // After an editor round-trip, the working-tree line we want the diff cursor
   // to land on. Read by the diff-load effect, then cleared.
@@ -129,9 +195,20 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         const r = await resolveRepo();
         setRepo(r);
         let src: DiffSource;
+        let driftNote = '';
         if (pr !== undefined) {
           const [info, diffs] = await Promise.all([resolvePr(pr), fetchPrDiff(pr)]);
           src = prSource(info, diffs);
+          const dpath = draftsPath(await gitDir(), pr);
+          draftsFileRef.current = dpath;
+          headShaRef.current = info.headRefOid;
+          const loaded = loadDrafts(dpath);
+          if (loaded) {
+            setComments(loaded.comments);
+            if (loaded.headSha !== info.headRefOid) {
+              driftNote = ' — ⚠ PR head moved since these drafts; anchors may be off';
+            }
+          }
         } else if (target) {
           src = commitSource(await resolveCommit(target));
         } else {
@@ -140,6 +217,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         sourceRef.current = src;
         setSource(src);
         await reloadFiles();
+        if (driftNote) setStatus((s) => s + driftNote);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
@@ -164,7 +242,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         const pending = pendingCursorLine.current;
         pendingCursorLine.current = null;
         setDiffCursor(pending === null ? 0 : rowForNewLine(lines, pending));
-        setDiffTop(0);
+        setRenderTop(0);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       }
@@ -174,15 +252,53 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     };
   }, [repo, source, selectedFile, selectedFile?.path]);
 
-  // Keep the diff cursor inside the visible viewport.
-  useEffect(() => {
-    if (diffCursor < diffTop) setDiffTop(diffCursor);
-    else if (diffCursor >= diffTop + diffViewport) setDiffTop(diffCursor - diffViewport + 1);
-  }, [diffCursor, diffTop, diffViewport]);
+  // Comments for the selected file, indexed by their (path, side, line) anchor.
+  const commentMap = useMemo(() => {
+    const m = new Map<string, DraftComment>();
+    for (const c of comments) m.set(anchorKey(c.path, c.side, c.line), c);
+    return m;
+  }, [comments]);
 
-  const visibleDiff = useMemo(
-    () => diffLines.slice(diffTop, diffTop + diffViewport),
-    [diffLines, diffTop, diffViewport],
+  // Per-file comment counts, for the file-list badges.
+  const commentCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of comments) m.set(c.path, (m.get(c.path) ?? 0) + 1);
+    return m;
+  }, [comments]);
+
+  // The drawn rows: each diff line, with any anchored comment block after it.
+  const renderRows = useMemo(() => {
+    const rows: RenderRow[] = [];
+    const path = selectedFile?.path;
+    diffLines.forEach((line, i) => {
+      let comment: DraftComment | undefined;
+      if (path) {
+        const a = anchorForLine(line);
+        if (a) comment = commentMap.get(anchorKey(path, a.side, a.line));
+      }
+      rows.push({ kind: 'diff', diffIndex: i, line, commented: !!comment });
+      if (comment) rows.push(...commentBlock(i, comment));
+    });
+    return rows;
+  }, [diffLines, commentMap, selectedFile?.path]);
+
+  // Where the cursor's diff line sits among the rendered rows.
+  const cursorRenderIndex = useMemo(
+    () => renderRows.findIndex((r) => r.kind === 'diff' && r.diffIndex === diffCursor),
+    [renderRows, diffCursor],
+  );
+
+  // Keep the cursor's rendered row inside the visible viewport.
+  useEffect(() => {
+    if (cursorRenderIndex < 0) return;
+    if (cursorRenderIndex < renderTop) setRenderTop(cursorRenderIndex);
+    else if (cursorRenderIndex >= renderTop + diffViewport)
+      setRenderTop(cursorRenderIndex - diffViewport + 1);
+  }, [cursorRenderIndex, renderTop, diffViewport]);
+
+  const visibleRows = useMemo(
+    () => renderRows.slice(renderTop, renderTop + diffViewport),
+    [renderRows, renderTop, diffViewport],
   );
 
   const openEditor = useCallback(() => {
@@ -232,6 +348,74 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     })();
   }, [source, selectedFile, diffLines, diffCursor, setRawMode]);
 
+  const persist = useCallback(
+    (next: DraftComment[]) => {
+      const file = draftsFileRef.current;
+      if (!file || pr === undefined || !headShaRef.current) return;
+      saveDrafts(file, { pr, headSha: headShaRef.current, comments: next });
+    },
+    [pr],
+  );
+
+  // Write or edit a draft comment on the current diff line (PR mode only).
+  const commentOnLine = useCallback(() => {
+    if (source?.kind !== 'pr' || !selectedFile) {
+      setStatus('Comments are available in PR review mode (--pr <n>).');
+      return;
+    }
+    const row = diffLines[diffCursor];
+    const anchor = row ? anchorForLine(row) : null;
+    if (!anchor) {
+      setStatus('Move to an added, removed, or context line to comment.');
+      return;
+    }
+    const existing = commentMap.get(anchorKey(selectedFile.path, anchor.side, anchor.line));
+
+    setRawMode(false);
+    leaveAltScreen();
+    const result = editTextInEditor(existing?.body ?? '');
+    enterAltScreen();
+    setRawMode(true);
+
+    if (!result.ok) {
+      setError(result.error ?? 'Editor failed.');
+      return;
+    }
+    const body = (result.text ?? '').trim();
+    const next = comments.filter(
+      (c) => !(c.path === selectedFile.path && c.side === anchor.side && c.line === anchor.line),
+    );
+    if (body) {
+      next.push({
+        path: selectedFile.path,
+        side: anchor.side,
+        line: anchor.line,
+        body,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    setComments(next);
+    persist(next);
+    setStatus(body ? 'Comment saved.' : 'Comment removed.');
+  }, [source, selectedFile, diffLines, diffCursor, comments, commentMap, persist, setRawMode]);
+
+  // Delete the draft comment on the current diff line, if any.
+  const deleteComment = useCallback(() => {
+    if (source?.kind !== 'pr' || !selectedFile) return;
+    const row = diffLines[diffCursor];
+    const anchor = row ? anchorForLine(row) : null;
+    if (!anchor || !commentMap.has(anchorKey(selectedFile.path, anchor.side, anchor.line))) {
+      setStatus('No comment on this line.');
+      return;
+    }
+    const next = comments.filter(
+      (c) => !(c.path === selectedFile.path && c.side === anchor.side && c.line === anchor.line),
+    );
+    setComments(next);
+    persist(next);
+    setStatus('Comment removed.');
+  }, [source, selectedFile, diffLines, diffCursor, comments, commentMap, persist]);
+
   useInput(
     (input, key) => {
     if (input === 'q' || (key.ctrl && input === 'c')) {
@@ -256,6 +440,14 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     }
     if (input === 'o') {
       openReadOnly();
+      return;
+    }
+    if (input === 'c') {
+      commentOnLine();
+      return;
+    }
+    if (input === 'd') {
+      deleteComment();
       return;
     }
 
@@ -331,7 +523,13 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
             files
               .slice(0, bodyHeight - 2)
               .map((f, i) => (
-                <FileRow key={f.path} file={f} active={pane === 'files'} selected={i === fileIdx} />
+                <FileRow
+                  key={f.path}
+                  file={f}
+                  active={pane === 'files'}
+                  selected={i === fileIdx}
+                  comments={commentCounts.get(f.path) ?? 0}
+                />
               ))
           )}
         </Box>
@@ -346,12 +544,21 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
           <Text dimColor wrap="truncate">
             {selectedFile ? selectedFile.path : 'Diff'}
           </Text>
-          {visibleDiff.length === 0 ? (
+          {visibleRows.length === 0 ? (
             <Text dimColor>{selectedFile ? '(no diff)' : 'Select a file'}</Text>
           ) : (
-            visibleDiff.map((line, i) => (
-              <DiffRow key={diffTop + i} line={line} selected={pane === 'diff' && diffTop + i === diffCursor} />
-            ))
+            visibleRows.map((row, i) =>
+              row.kind === 'comment' ? (
+                <CommentRow key={renderTop + i} text={row.text} meta={row.meta} />
+              ) : (
+                <DiffRow
+                  key={renderTop + i}
+                  line={row.line}
+                  selected={pane === 'diff' && row.diffIndex === diffCursor}
+                  gutter={source?.kind === 'pr' ? (row.commented ? '● ' : '  ') : undefined}
+                />
+              ),
+            )
           )}
         </Box>
       </Box>
@@ -365,8 +572,13 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
               <Text color="cyan">e</Text> edit@line{' '}
             </Text>
           ) : null}
-          <Text color="cyan">o</Text> view <Text color="cyan">r</Text> refresh{' '}
-          <Text color="cyan">q</Text> quit
+          <Text color="cyan">o</Text> view{' '}
+          {source?.kind === 'pr' ? (
+            <Text>
+              <Text color="cyan">c</Text> comment <Text color="cyan">d</Text> delete{' '}
+            </Text>
+          ) : null}
+          <Text color="cyan">r</Text> refresh <Text color="cyan">q</Text> quit
         </Text>
         <Text dimColor> — {status}</Text>
       </Box>

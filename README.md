@@ -58,8 +58,17 @@ differ --pr 234
 
 This shells out to the [GitHub CLI](https://cli.github.com) (`gh pr diff`), so
 `gh` must be installed and authenticated (`gh auth login`). It is **fetch-only**:
-your working tree and current branch are left untouched. Editing is disabled in
-this mode for now — writing comments and code suggestions is the next milestone.
+your working tree and current branch are left untouched. Editing the diff is
+disabled in this mode (code suggestions are coming), but you can browse with `o`
+and leave review comments with `c`.
+
+### Commenting on a PR
+
+In PR mode, put the cursor on any diff line and press `c` to write a review
+comment in `$EDITOR`; press `c` again on a commented line to edit it, or `d` to
+delete it. Comments appear inline beneath their line, the file list shows a
+`●n` badge per file, and drafts are saved to `.git/differ/pr-<n>.json` so they
+survive across runs. Submitting the review to GitHub is the next milestone.
 
 ## Keys
 
@@ -69,6 +78,8 @@ this mode for now — writing comments and code suggestions is the next mileston
 | `Tab`, `←`/`→`   | Switch between the file list and the diff         |
 | `e`            | Open the current file in `$EDITOR` at the cursor line (edit) |
 | `o`            | Open the current file read-only at the cursor line (browse)  |
+| `c`            | Write/edit a review comment on the line (PR mode) |
+| `d`            | Delete the review comment on the line (PR mode)   |
 | `r`            | Refresh                                           |
 | `q`            | Quit                                              |
 

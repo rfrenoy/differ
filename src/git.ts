@@ -48,6 +48,11 @@ export async function resolveRepo(): Promise<Repo> {
   return { root, hasHead };
 }
 
+/** Absolute path to the repo's git directory (for storing differ's own state). */
+export async function gitDir(): Promise<string> {
+  return (await git.revparse(['--absolute-git-dir'])).trim();
+}
+
 function kindFromCode(code: string): ChangeKind {
   const c = code.trim();
   if (code === '??') return 'untracked';

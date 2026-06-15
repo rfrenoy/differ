@@ -108,3 +108,26 @@ export function openInEditor(file: string, line: number, cwd: string): OpenResul
   }
   return { ok: true, cursorLine };
 }
+
+/**
+ * Open `file` at `line` read-only, for browsing code around a diff. Like
+ * openInEditor but with no cursor capture (nothing changes) and the editor's
+ * read-only flag where one exists (vim-family `-R`, nano `-v`).
+ */
+export function viewInEditor(file: string, line: number, cwd: string): OpenResult {
+  const editor = resolveEditor();
+  const [cmd, ...preArgs] = editor.split(/\s+/);
+  const name = editorName(editor);
+
+  const args = [...preArgs];
+  if (VIM_FAMILY.has(name)) args.push('-R');
+  else if (name === 'nano') args.push('-v');
+  args.push(...editorArgs(editor, file, Math.max(1, line)));
+
+  const result = spawnSync(cmd, args, { stdio: 'inherit', cwd });
+  if (result.error) return { ok: false, error: `${cmd}: ${result.error.message}` };
+  if (typeof result.status === 'number' && result.status !== 0) {
+    return { ok: false, error: `${cmd} exited with status ${result.status}` };
+  }
+  return { ok: true };
+}

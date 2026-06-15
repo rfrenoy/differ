@@ -76,6 +76,12 @@ export async function fetchPrDiff(n: number): Promise<PrFileDiff[]> {
   return splitUnifiedDiff(raw);
 }
 
+/** URL of the base repository (where refs/pull/<n>/head lives, even for forks). */
+export async function repoUrl(): Promise<string> {
+  const json = await runGh(['repo', 'view', '--json', 'url']);
+  return (JSON.parse(json) as { url: string }).url;
+}
+
 function unquotePath(p: string): string {
   const t = p.trim();
   // git quotes paths containing unusual characters in double quotes.

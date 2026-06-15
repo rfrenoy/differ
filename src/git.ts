@@ -1,3 +1,7 @@
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { simpleGit, type SimpleGit } from 'simple-git';
 
 export type ChangeKind = 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked';
@@ -23,6 +27,8 @@ export interface Repo {
 // root-relative paths while diff resolves them against the subdir, yielding
 // empty diffs.
 let git: SimpleGit = simpleGit();
+// Repo root, captured by resolveRepo; needed for synchronous worktree cleanup.
+let repoRoot = '';
 
 export async function resolveRepo(): Promise<Repo> {
   const isRepo = await git.checkIsRepo();
@@ -32,6 +38,7 @@ export async function resolveRepo(): Promise<Repo> {
   const root = (await git.revparse(['--show-toplevel'])).trim();
   // Re-pin every subsequent git command to the repo root.
   git = simpleGit(root);
+  repoRoot = root;
   let hasHead = true;
   try {
     await git.revparse(['HEAD']);
@@ -148,4 +155,33 @@ export async function listCommitFiles(commit: CommitInfo): Promise<ChangedFile[]
 export async function diffForCommitFile(commit: CommitInfo, file: ChangedFile): Promise<string> {
   const base = commit.hasParent ? `${commit.sha}^` : EMPTY_TREE;
   return git.diff(['--no-color', base, commit.sha, '--', file.path]);
+}
+
+// Temp worktrees created for read-only browsing, removed on exit.
+const tempWorktrees: string[] = [];
+
+/**
+ * Check out `commitish` into a fresh detached worktree under a temp directory
+ * and return its path. The user's working tree and current branch are left
+ * untouched. The objects for `commitish` must already be present locally.
+ */
+export async function addDetachedWorktree(commitish: string): Promise<string> {
+  // git refuses to create a worktree in an existing directory, so point it at a
+  // not-yet-existing leaf inside a temp dir we own.
+  const dir = join(mkdtempSync(join(tmpdir(), 'differ-wt-')), 'tree');
+  await git.raw(['worktree', 'add', '--detach', dir, commitish]);
+  tempWorktrees.push(dir);
+  return dir;
+}
+
+/** Fetch a single ref (e.g. a PR's pull/N/head) from a remote URL into the object store. */
+export async function fetchRef(remote: string, ref: string): Promise<void> {
+  await git.fetch([remote, ref]);
+}
+
+/** Remove every temp worktree we created. Synchronous, safe to call from a process-exit handler. */
+export function cleanupWorktrees(): void {
+  for (const dir of tempWorktrees.splice(0)) {
+    spawnSync('git', ['-C', repoRoot, 'worktree', 'remove', '--force', dir], { stdio: 'ignore' });
+  }
 }

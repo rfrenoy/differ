@@ -4,7 +4,8 @@ import { type ChangedFile, type Repo, resolveCommit, resolveRepo } from './git.j
 import { fetchPrDiff, resolvePr } from './gh.js';
 import { type DiffSource, commitSource, prSource, worktreeSource } from './source.js';
 import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
-import { openInEditor } from './editor.js';
+import { openInEditor, viewInEditor } from './editor.js';
+import { join } from 'node:path';
 import { enterAltScreen, leaveAltScreen } from './screen.js';
 
 type Pane = 'files' | 'diff';
@@ -206,6 +207,31 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     void reloadFiles();
   }, [repo, selectedFile, diffLines, diffCursor, reloadFiles, setRawMode]);
 
+  // Open the current file read-only at the cursor line, so you can browse the
+  // code around a diff. In commit/PR mode this is a detached worktree at the
+  // right revision (provisioned on first use), enabling cross-file navigation.
+  const openReadOnly = useCallback(() => {
+    if (!source || !selectedFile) return;
+    const line = newLineAt(diffLines, diffCursor);
+    void (async () => {
+      let dir: string;
+      try {
+        setStatus('Preparing read-only view…');
+        dir = await source.contextRoot();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      setRawMode(false);
+      leaveAltScreen();
+      const result = viewInEditor(join(dir, selectedFile.path), line, dir);
+      enterAltScreen();
+      setRawMode(true);
+      if (!result.ok) setError(result.error ?? 'Editor failed.');
+      else setStatus(`Viewed ${selectedFile.path}`);
+    })();
+  }, [source, selectedFile, diffLines, diffCursor, setRawMode]);
+
   useInput(
     (input, key) => {
     if (input === 'q' || (key.ctrl && input === 'c')) {
@@ -226,6 +252,10 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         return;
       }
       openEditor();
+      return;
+    }
+    if (input === 'o') {
+      openReadOnly();
       return;
     }
 
@@ -335,7 +365,8 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
               <Text color="cyan">e</Text> edit@line{' '}
             </Text>
           ) : null}
-          <Text color="cyan">r</Text> refresh <Text color="cyan">q</Text> quit
+          <Text color="cyan">o</Text> view <Text color="cyan">r</Text> refresh{' '}
+          <Text color="cyan">q</Text> quit
         </Text>
         <Text dimColor> — {status}</Text>
       </Box>

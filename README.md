@@ -67,9 +67,23 @@ this mode for now — writing comments and code suggestions is the next mileston
 | -------------- | ------------------------------------------------- |
 | `↑`/`↓`, `j`/`k` | Move within the active pane                       |
 | `Tab`, `←`/`→`   | Switch between the file list and the diff         |
-| `e`            | Open the current file in `$EDITOR` at the cursor line |
+| `e`            | Open the current file in `$EDITOR` at the cursor line (edit) |
+| `o`            | Open the current file read-only at the cursor line (browse)  |
 | `r`            | Refresh                                           |
 | `q`            | Quit                                              |
+
+## Browsing around a diff (`o`)
+
+`o` opens the current file **read-only** (`nvim -R`, `view`, …) at the cursor's
+line, so you can scroll past the diff hunks and follow code into other files —
+useful when a change calls a function you can't see in the diff.
+
+In working-tree mode this opens the live file. In commit and PR modes it opens
+the file from a **detached `git worktree`** checked out at that revision (the
+commit, or the PR head), so you see the code exactly as of that point and get
+full cross-file navigation / LSP. The worktree is created on first use and
+removed on exit; your branch and working tree are never touched. For a PR this
+fetches `refs/pull/<n>/head` the first time (works for forks too).
 
 ## Editor
 

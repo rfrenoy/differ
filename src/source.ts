@@ -2,12 +2,14 @@ import {
   type ChangedFile,
   type CommitInfo,
   type Repo,
+  addDetachedWorktree,
   diffForCommitFile,
   diffForFile,
+  fetchRef,
   listChangedFiles,
   listCommitFiles,
 } from './git.js';
-import { type PrFileDiff, type PrInfo, prChangedFiles } from './gh.js';
+import { type PrFileDiff, type PrInfo, prChangedFiles, repoUrl } from './gh.js';
 
 export interface SourceHeader {
   /** Text shown in the colored badge at the left of the title bar. */
@@ -31,6 +33,12 @@ export interface DiffSource {
   loadDiff(file: ChangedFile): Promise<string>;
   /** One-line status summarizing the file count. */
   status(count: number): string;
+  /**
+   * Directory to open files from for read-only browsing, provisioned lazily and
+   * cached. The live tree for working-tree mode; a detached worktree at the
+   * commit/PR head otherwise.
+   */
+  contextRoot(): Promise<string>;
 }
 
 export function worktreeSource(repo: Repo): DiffSource {
@@ -42,10 +50,12 @@ export function worktreeSource(repo: Repo): DiffSource {
     loadDiff: (file) => diffForFile(file, repo.hasHead),
     status: (count) =>
       count === 0 ? 'No changes — working tree clean.' : `${count} changed file(s)`,
+    contextRoot: async () => repo.root,
   };
 }
 
 export function commitSource(commit: CommitInfo): DiffSource {
+  let dirPromise: Promise<string> | null = null;
   return {
     kind: 'commit',
     header: {
@@ -57,11 +67,14 @@ export function commitSource(commit: CommitInfo): DiffSource {
     listFiles: () => listCommitFiles(commit),
     loadDiff: (file) => diffForCommitFile(commit, file),
     status: (count) => `${count} file(s) in ${commit.shortSha} — ${commit.subject}`,
+    // The commit's objects are already local; just check it out detached.
+    contextRoot: () => (dirPromise ??= addDetachedWorktree(commit.sha)),
   };
 }
 
 export function prSource(pr: PrInfo, files: PrFileDiff[]): DiffSource {
   const byPath = new Map(files.map((f) => [f.path, f.raw]));
+  let dirPromise: Promise<string> | null = null;
   return {
     kind: 'pr',
     header: {
@@ -75,5 +88,12 @@ export function prSource(pr: PrInfo, files: PrFileDiff[]): DiffSource {
     listFiles: async () => prChangedFiles(files),
     loadDiff: async (file) => byPath.get(file.path) ?? '',
     status: (count) => `${count} file(s) in PR #${pr.number}`,
+    // Fetch the PR head objects (works for forks via refs/pull/N/head), then
+    // check them out into a detached worktree for browsing.
+    contextRoot: () =>
+      (dirPromise ??= (async () => {
+        await fetchRef(await repoUrl(), `pull/${pr.number}/head`);
+        return addDetachedWorktree(pr.headRefOid);
+      })()),
   };
 }

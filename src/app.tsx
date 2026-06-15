@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
 import { type ChangedFile, type Repo, gitDir, resolveCommit, resolveRepo } from './git.js';
-import { fetchPrDiff, resolvePr } from './gh.js';
+import { type PrComment, fetchPrComments, fetchPrDiff, resolvePr } from './gh.js';
 import { type DiffSource, commitSource, prSource, worktreeSource } from './source.js';
 import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
 import { editTextInEditor, openInEditor, viewInEditor } from './editor.js';
@@ -100,9 +100,9 @@ function DiffRow({ line, selected, gutter }: { line: DiffLine; selected: boolean
 }
 
 /** A single rendered line within a comment block shown under a diff line. */
-function CommentRow({ text, meta }: { text: string; meta: boolean }) {
+function CommentRow({ text, meta, tone }: { text: string; meta: boolean; tone: 'draft' | 'existing' }) {
   return (
-    <Text wrap="truncate" color={meta ? undefined : 'yellow'} dimColor={meta}>
+    <Text wrap="truncate" color={tone === 'draft' ? 'yellow' : 'cyan'} dimColor={meta}>
       {text.length > 0 ? text : ' '}
     </Text>
   );
@@ -110,13 +110,13 @@ function CommentRow({ text, meta }: { text: string; meta: boolean }) {
 
 /**
  * What actually gets drawn in the diff pane: each diff line, optionally
- * followed by the rendered lines of a comment anchored to it.
+ * followed by the rendered lines of comments anchored to it.
  */
 type RenderRow =
   | { kind: 'diff'; diffIndex: number; line: DiffLine; commented: boolean }
-  | { kind: 'comment'; diffIndex: number; text: string; meta: boolean };
+  | { kind: 'comment'; diffIndex: number; text: string; meta: boolean; tone: 'draft' | 'existing' };
 
-/** The comment anchor (side + file line) a diff row maps to, if any. */
+/** The anchor (side + file line) for a *new draft* on a diff row, if any. */
 function anchorForLine(line: DiffLine): { side: Side; line: number } | null {
   if (line.type === 'del') {
     return line.oldLine === undefined ? null : { side: 'LEFT', line: line.oldLine };
@@ -127,13 +127,49 @@ function anchorForLine(line: DiffLine): { side: Side; line: number } | null {
   return null;
 }
 
+/**
+ * Every anchor key a diff row can carry. Context lines exist on both sides, so
+ * they can hold a comment keyed to either the old (LEFT) or new (RIGHT) line.
+ */
+function lineAnchorKeys(line: DiffLine, path: string): string[] {
+  const keys: string[] = [];
+  if (line.type === 'del' && line.oldLine !== undefined) keys.push(anchorKey(path, 'LEFT', line.oldLine));
+  if (line.type === 'add' && line.newLine !== undefined) keys.push(anchorKey(path, 'RIGHT', line.newLine));
+  if (line.type === 'context') {
+    if (line.newLine !== undefined) keys.push(anchorKey(path, 'RIGHT', line.newLine));
+    if (line.oldLine !== undefined) keys.push(anchorKey(path, 'LEFT', line.oldLine));
+  }
+  return keys;
+}
+
 /** Render a draft comment as indented lines beneath its diff line. */
 function commentBlock(diffIndex: number, c: DraftComment): RenderRow[] {
-  const rows: RenderRow[] = [{ kind: 'comment', diffIndex, text: '    ┌ you (draft)', meta: true }];
+  const rows: RenderRow[] = [
+    { kind: 'comment', diffIndex, text: '    ┌ you (draft)', meta: true, tone: 'draft' },
+  ];
   for (const b of c.body.split('\n')) {
-    rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false });
+    rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false, tone: 'draft' });
   }
-  rows.push({ kind: 'comment', diffIndex, text: '    └ c edit · d delete', meta: true });
+  rows.push({ kind: 'comment', diffIndex, text: '    └ c edit · d delete', meta: true, tone: 'draft' });
+  return rows;
+}
+
+/** Render an existing PR thread (one or more comments) read-only beneath its line. */
+function existingCommentBlock(diffIndex: number, comments: PrComment[]): RenderRow[] {
+  const rows: RenderRow[] = [];
+  comments.forEach((c, idx) => {
+    rows.push({
+      kind: 'comment',
+      diffIndex,
+      text: `    ${idx === 0 ? '┌' : '├'} ${c.author}:`,
+      meta: true,
+      tone: 'existing',
+    });
+    for (const b of c.body.split('\n')) {
+      rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false, tone: 'existing' });
+    }
+  });
+  rows.push({ kind: 'comment', diffIndex, text: '    └ (read-only)', meta: true, tone: 'existing' });
   return rows;
 }
 
@@ -160,6 +196,9 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
   const [comments, setComments] = useState<DraftComment[]>([]);
   const draftsFileRef = useRef<string | null>(null);
   const headShaRef = useRef<string | null>(null);
+
+  // Existing inline comments already on the PR (read-only).
+  const [prComments, setPrComments] = useState<PrComment[]>([]);
 
   // After an editor round-trip, the working-tree line we want the diff cursor
   // to land on. Read by the diff-load effect, then cleared.
@@ -197,8 +236,14 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         let src: DiffSource;
         let driftNote = '';
         if (pr !== undefined) {
-          const [info, diffs] = await Promise.all([resolvePr(pr), fetchPrDiff(pr)]);
+          const [info, diffs, existing] = await Promise.all([
+            resolvePr(pr),
+            fetchPrDiff(pr),
+            // A comments failure (e.g. permissions) shouldn't block the review.
+            fetchPrComments(pr).catch(() => [] as PrComment[]),
+          ]);
           src = prSource(info, diffs);
+          setPrComments(existing);
           const dpath = draftsPath(await gitDir(), pr);
           draftsFileRef.current = dpath;
           headShaRef.current = info.headRefOid;
@@ -259,28 +304,54 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     return m;
   }, [comments]);
 
-  // Per-file comment counts, for the file-list badges.
+  // Per-file draft-comment counts, for the file-list badges.
   const commentCounts = useMemo(() => {
     const m = new Map<string, number>();
     for (const c of comments) m.set(c.path, (m.get(c.path) ?? 0) + 1);
     return m;
   }, [comments]);
 
-  // The drawn rows: each diff line, with any anchored comment block after it.
+  // Existing PR comments, grouped by anchor (skipping outdated ones).
+  const existingByAnchor = useMemo(() => {
+    const m = new Map<string, PrComment[]>();
+    for (const c of prComments) {
+      if (c.line === null) continue;
+      const k = anchorKey(c.path, c.side, c.line);
+      const arr = m.get(k);
+      if (arr) arr.push(c);
+      else m.set(k, [c]);
+    }
+    return m;
+  }, [prComments]);
+
+  // Outdated comments (their line no longer maps to the current diff) are hidden
+  // inline but surfaced as a count.
+  const outdatedCount = useMemo(
+    () => prComments.filter((c) => c.line === null).length,
+    [prComments],
+  );
+
+  // The drawn rows: each diff line, then any existing thread, then a draft.
   const renderRows = useMemo(() => {
     const rows: RenderRow[] = [];
     const path = selectedFile?.path;
     diffLines.forEach((line, i) => {
-      let comment: DraftComment | undefined;
+      let existing: PrComment[] = [];
+      let draft: DraftComment | undefined;
       if (path) {
+        for (const k of lineAnchorKeys(line, path)) {
+          const list = existingByAnchor.get(k);
+          if (list) existing = existing.concat(list);
+        }
         const a = anchorForLine(line);
-        if (a) comment = commentMap.get(anchorKey(path, a.side, a.line));
+        if (a) draft = commentMap.get(anchorKey(path, a.side, a.line));
       }
-      rows.push({ kind: 'diff', diffIndex: i, line, commented: !!comment });
-      if (comment) rows.push(...commentBlock(i, comment));
+      rows.push({ kind: 'diff', diffIndex: i, line, commented: existing.length > 0 || !!draft });
+      if (existing.length > 0) rows.push(...existingCommentBlock(i, existing));
+      if (draft) rows.push(...commentBlock(i, draft));
     });
     return rows;
-  }, [diffLines, commentMap, selectedFile?.path]);
+  }, [diffLines, commentMap, existingByAnchor, selectedFile?.path]);
 
   // Where the cursor's diff line sits among the rendered rows.
   const cursorRenderIndex = useMemo(
@@ -549,7 +620,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
           ) : (
             visibleRows.map((row, i) =>
               row.kind === 'comment' ? (
-                <CommentRow key={renderTop + i} text={row.text} meta={row.meta} />
+                <CommentRow key={renderTop + i} text={row.text} meta={row.meta} tone={row.tone} />
               ) : (
                 <DiffRow
                   key={renderTop + i}
@@ -581,6 +652,13 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
           <Text color="cyan">r</Text> refresh <Text color="cyan">q</Text> quit
         </Text>
         <Text dimColor> — {status}</Text>
+        {source?.kind === 'pr' && prComments.length > 0 ? (
+          <Text dimColor>
+            {' '}
+            · {prComments.length} comment{prComments.length === 1 ? '' : 's'}
+            {outdatedCount > 0 ? ` · ${outdatedCount} outdated` : ''}
+          </Text>
+        ) : null}
       </Box>
     </Box>
   );

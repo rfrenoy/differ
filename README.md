@@ -70,6 +70,11 @@ delete it. Comments appear inline beneath their line, the file list shows a
 `●n` badge per file, and drafts are saved to `.git/differ/pr-<n>.json` so they
 survive across runs. Submitting the review to GitHub is the next milestone.
 
+The PR's **existing** review comments are also fetched and shown inline (in
+cyan, with the author's name and any reply thread) — read-only for now.
+Comments whose line no longer maps to the current diff are counted as
+"outdated" in the status bar rather than shown.
+
 ## Keys
 
 | Key            | Action                                            |

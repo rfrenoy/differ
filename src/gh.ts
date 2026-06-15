@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ChangeKind, ChangedFile } from './git.js';
+import type { Side } from './comments.js';
 
 const pExecFile = promisify(execFile);
 
@@ -80,6 +81,47 @@ export async function fetchPrDiff(n: number): Promise<PrFileDiff[]> {
 export async function repoUrl(): Promise<string> {
   const json = await runGh(['repo', 'view', '--json', 'url']);
   return (JSON.parse(json) as { url: string }).url;
+}
+
+/** An existing inline review comment on the PR (read-only, with its author). */
+export interface PrComment {
+  id: number;
+  author: string;
+  body: string;
+  path: string;
+  side: Side;
+  /** Line in the file for `side`; null when the comment is outdated. */
+  line: number | null;
+  inReplyToId: number | null;
+  createdAt: string;
+}
+
+/** Fetch the PR's existing inline review comments (all pages), oldest first. */
+export async function fetchPrComments(n: number): Promise<PrComment[]> {
+  // gh expands {owner}/{repo} from the current repo; --paginate merges pages.
+  const json = await runGh(['api', '--paginate', `repos/{owner}/{repo}/pulls/${n}/comments`]);
+  const data = JSON.parse(json) as Array<{
+    id: number;
+    user?: { login?: string };
+    body?: string;
+    path: string;
+    side?: string;
+    line?: number | null;
+    in_reply_to_id?: number | null;
+    created_at: string;
+  }>;
+  return data
+    .map((c) => ({
+      id: c.id,
+      author: c.user?.login ?? '',
+      body: c.body ?? '',
+      path: c.path,
+      side: (c.side === 'LEFT' ? 'LEFT' : 'RIGHT') as Side,
+      line: typeof c.line === 'number' ? c.line : null,
+      inReplyToId: c.in_reply_to_id ?? null,
+      createdAt: c.created_at,
+    }))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 function unquotePath(p: string): string {

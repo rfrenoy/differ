@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Box, Text, useApp, useInput, useStdin } from 'ink';
+import { Box, Text, useApp, useInput, useStdin, useStdout } from 'ink';
 import { type ChangedFile, type Repo, gitDir, resolveCommit, resolveRepo } from './git.js';
 import {
   type PrComment,
@@ -29,20 +29,24 @@ type Pane = 'files' | 'diff';
 /** Fixed width (in columns) of the file-list pane. The diff pane fills the rest. */
 const FILE_COL_WIDTH = 36;
 
-/** Tracks the live terminal size so panes can resize with the window. */
+/**
+ * Tracks the live terminal size so panes can resize with the window. Reads the
+ * stdout Ink actually renders to (not the global), so our layout height always
+ * matches what Ink paints — important to avoid tripping its fullscreen clear.
+ */
 function useTerminalSize(): { rows: number; columns: number } {
+  const { stdout } = useStdout();
   const [size, setSize] = useState({
-    rows: process.stdout.rows ?? 24,
-    columns: process.stdout.columns ?? 80,
+    rows: stdout.rows ?? 24,
+    columns: stdout.columns ?? 80,
   });
   useEffect(() => {
-    const onResize = () =>
-      setSize({ rows: process.stdout.rows ?? 24, columns: process.stdout.columns ?? 80 });
-    process.stdout.on('resize', onResize);
+    const onResize = () => setSize({ rows: stdout.rows ?? 24, columns: stdout.columns ?? 80 });
+    stdout.on('resize', onResize);
     return () => {
-      process.stdout.off('resize', onResize);
+      stdout.off('resize', onResize);
     };
-  }, []);
+  }, [stdout]);
   return size;
 }
 
@@ -257,9 +261,14 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
 
   const selectedFile = files[fileIdx];
 
-  // Layout math: 1 row header + 1 row footer, the rest is the body.
-  const bodyHeight = Math.max(3, rows - 2);
-  const diffViewport = bodyHeight; // rows available inside the diff pane
+  // Layout math: 1 row title bar + 1 row footer, plus one spare row kept below
+  // the body so total output stays under the terminal height — otherwise Ink
+  // treats us as "fullscreen" and clears the whole screen each frame (flicker).
+  const bodyHeight = Math.max(4, rows - 3);
+  // Rows actually visible inside a pane: its height minus the rounded border (2)
+  // and the one-line pane header. Rendering more than this overflows the pane.
+  const paneRows = Math.max(1, bodyHeight - 3);
+  const diffViewport = paneRows;
 
   const reloadFiles = useCallback(async () => {
     try {
@@ -745,6 +754,22 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       return;
     }
 
+    // H/M/L: jump the cursor to the top/middle/bottom visible diff line (vim
+    // screen motions), within the current viewport — no scrolling.
+    if (pane === 'diff' && (input === 'H' || input === 'M' || input === 'L')) {
+      const top = renderTopRef.current;
+      const visibleDiffRows = renderRows
+        .slice(top, top + diffViewport)
+        .filter((r) => r.kind === 'diff');
+      if (visibleDiffRows.length > 0) {
+        const pick =
+          input === 'H' ? 0 : input === 'L' ? visibleDiffRows.length - 1 : (visibleDiffRows.length - 1) >> 1;
+        const targetRow = visibleDiffRows[pick];
+        if (targetRow.kind === 'diff') setDiffCursor(targetRow.diffIndex);
+      }
+      return;
+    }
+
     const down = key.downArrow || input === 'j';
     const up = key.upArrow || input === 'k';
     if (!down && !up) return;
@@ -805,7 +830,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       { v: 'REQUEST_CHANGES', label: 'Request changes' },
     ];
     return (
-      <Box flexDirection="column" width={columns} height={rows} padding={1}>
+      <Box flexDirection="column" width={columns} height={rows - 1} padding={1}>
         <Text bold>
           Submit review · <Text color="cyan">PR #{pr}</Text>
         </Text>
@@ -879,7 +904,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
   }
 
   return (
-    <Box flexDirection="column" width={columns} height={rows}>
+    <Box flexDirection="column" width={columns} height={rows - 1}>
       {/* Header */}
       <Box>
         <Text backgroundColor={source?.header.color ?? 'blue'} color="white" bold>
@@ -903,7 +928,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
             <Text dimColor>— none —</Text>
           ) : (
             files
-              .slice(0, bodyHeight - 2)
+              .slice(0, paneRows)
               .map((f, i) => (
                 <FileRow
                   key={f.path}
@@ -945,9 +970,10 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         </Box>
       </Box>
 
-      {/* Footer */}
+      {/* Footer — kept to a single truncated line so it never wraps (a wrapped
+          footer would push output to full height and re-trigger Ink's clear). */}
       <Box>
-        <Text>
+        <Text wrap="truncate">
           <Text color="cyan">↑↓/jk</Text> move <Text color="cyan">tab</Text> pane{' '}
           <Text color="cyan">z</Text> {filesExpanded ? 'shrink' : 'widen'}{' '}
           {source?.editable ? (
@@ -963,15 +989,15 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
             </Text>
           ) : null}
           <Text color="cyan">r</Text> refresh <Text color="cyan">q</Text> quit
+          <Text dimColor> — {status}</Text>
+          {source?.kind === 'pr' && prComments.length > 0 ? (
+            <Text dimColor>
+              {' '}
+              · {prComments.length} comment{prComments.length === 1 ? '' : 's'}
+              {outdatedCount > 0 ? ` · ${outdatedCount} outdated` : ''}
+            </Text>
+          ) : null}
         </Text>
-        <Text dimColor> — {status}</Text>
-        {source?.kind === 'pr' && prComments.length > 0 ? (
-          <Text dimColor>
-            {' '}
-            · {prComments.length} comment{prComments.length === 1 ? '' : 's'}
-            {outdatedCount > 0 ? ` · ${outdatedCount} outdated` : ''}
-          </Text>
-        ) : null}
       </Box>
     </Box>
   );

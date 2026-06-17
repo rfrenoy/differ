@@ -71,9 +71,22 @@ delete it. Comments appear inline beneath their line, the file list shows a
 survive across runs. Submitting the review to GitHub is the next milestone.
 
 The PR's **existing** review comments are also fetched and shown inline (in
-cyan, with the author's name and any reply thread) — read-only for now.
-Comments whose line no longer maps to the current diff are counted as
-"outdated" in the status bar rather than shown.
+cyan, with the author's name and any reply thread). Pressing `d` on an existing
+comment marks it for deletion (`✗`, in red); the deletion is applied when you
+submit. Comments whose line no longer maps to the current diff are counted as
+"outdated" in the status bar rather than shown. `r` re-fetches the PR's
+comments.
+
+### Submitting the review
+
+Press `S` to open the submit screen: pick a verdict (comment / approve /
+request changes) with `↑`/`↓`, optionally write an overall summary with `m`
+(opens `$EDITOR`), review the comments grouped by file, and press `enter` to
+send — or `esc` to cancel. differ posts the whole review in one call, applies
+any pending deletions, then re-fetches the PR's comments so your just-submitted
+comments stay visible (now read-only) and deleted ones disappear — no restart.
+Local drafts are cleared on success. Comments are anchored to the commit you
+reviewed; if the PR head moved meanwhile, the screen warns you.
 
 ## Keys
 
@@ -85,6 +98,7 @@ Comments whose line no longer maps to the current diff are counted as
 | `o`            | Open the current file read-only at the cursor line (browse)  |
 | `c`            | Write/edit a review comment on the line (PR mode) |
 | `d`            | Delete the review comment on the line (PR mode)   |
+| `S`            | Submit the review to GitHub (PR mode)             |
 | `r`            | Refresh                                           |
 | `q`            | Quit                                              |
 

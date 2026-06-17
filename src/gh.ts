@@ -1,9 +1,31 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ChangeKind, ChangedFile } from './git.js';
 import type { Side } from './comments.js';
 
 const pExecFile = promisify(execFile);
+
+/** Run `gh` feeding `input` on stdin (execFile's promise form can't pipe stdin). */
+function runGhInput(args: string[], input: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('gh', args);
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    child.on('error', (e: NodeJS.ErrnoException) => {
+      reject(
+        e.code === 'ENOENT'
+          ? new Error('GitHub CLI (gh) not found. Install it from https://cli.github.com.')
+          : e,
+      );
+    });
+    child.on('close', (code) =>
+      code === 0 ? resolve(out) : reject(new Error(err.trim() || `gh exited with status ${code}`)),
+    );
+    child.stdin.end(input);
+  });
+}
 
 export interface PrInfo {
   number: number;
@@ -94,6 +116,40 @@ export interface PrComment {
   line: number | null;
   inReplyToId: number | null;
   createdAt: string;
+}
+
+export type ReviewEvent = 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
+
+export interface ReviewPayload {
+  event: ReviewEvent;
+  body: string;
+  /** The commit the comments are anchored to (what the user reviewed). */
+  commitId: string;
+  comments: { path: string; line: number; side: Side; body: string }[];
+}
+
+/** Submit a review (verdict + summary + inline comments) to the PR, atomically. */
+export async function submitReview(n: number, payload: ReviewPayload): Promise<void> {
+  const json = JSON.stringify({
+    commit_id: payload.commitId,
+    body: payload.body,
+    event: payload.event,
+    comments: payload.comments.map((c) => ({
+      path: c.path,
+      line: c.line,
+      side: c.side,
+      body: c.body,
+    })),
+  });
+  await runGhInput(
+    ['api', '--method', 'POST', `repos/{owner}/{repo}/pulls/${n}/reviews`, '--input', '-'],
+    json,
+  );
+}
+
+/** Delete a single existing review comment by id (must be yours, or you need write access). */
+export async function deletePrComment(id: number): Promise<void> {
+  await runGh(['api', '--method', 'DELETE', `repos/{owner}/{repo}/pulls/comments/${id}`]);
 }
 
 /** Fetch the PR's existing inline review comments (all pages), oldest first. */

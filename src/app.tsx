@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
 import { type ChangedFile, type Repo, gitDir, resolveCommit, resolveRepo } from './git.js';
-import { type PrComment, fetchPrComments, fetchPrDiff, resolvePr } from './gh.js';
+import {
+  type PrComment,
+  type ReviewEvent,
+  deletePrComment,
+  fetchPrComments,
+  fetchPrDiff,
+  resolvePr,
+  submitReview,
+} from './gh.js';
 import { type DiffSource, commitSource, prSource, worktreeSource } from './source.js';
 import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
 import { editTextInEditor, openInEditor, viewInEditor } from './editor.js';
@@ -99,10 +107,17 @@ function DiffRow({ line, selected, gutter }: { line: DiffLine; selected: boolean
   );
 }
 
+type CommentTone = 'draft' | 'existing' | 'tombstone';
+const TONE_COLOR: Record<CommentTone, string> = {
+  draft: 'yellow',
+  existing: 'cyan',
+  tombstone: 'red',
+};
+
 /** A single rendered line within a comment block shown under a diff line. */
-function CommentRow({ text, meta, tone }: { text: string; meta: boolean; tone: 'draft' | 'existing' }) {
+function CommentRow({ text, meta, tone }: { text: string; meta: boolean; tone: CommentTone }) {
   return (
-    <Text wrap="truncate" color={tone === 'draft' ? 'yellow' : 'cyan'} dimColor={meta}>
+    <Text wrap="truncate" color={TONE_COLOR[tone]} dimColor={meta}>
       {text.length > 0 ? text : ' '}
     </Text>
   );
@@ -114,7 +129,7 @@ function CommentRow({ text, meta, tone }: { text: string; meta: boolean; tone: '
  */
 type RenderRow =
   | { kind: 'diff'; diffIndex: number; line: DiffLine; commented: boolean }
-  | { kind: 'comment'; diffIndex: number; text: string; meta: boolean; tone: 'draft' | 'existing' };
+  | { kind: 'comment'; diffIndex: number; text: string; meta: boolean; tone: CommentTone };
 
 /** The anchor (side + file line) for a *new draft* on a diff row, if any. */
 function anchorForLine(line: DiffLine): { side: Side; line: number } | null {
@@ -154,22 +169,46 @@ function commentBlock(diffIndex: number, c: DraftComment): RenderRow[] {
   return rows;
 }
 
+/** Existing PR comments anchored to a diff line, gathered across its anchor keys. */
+function gatherExisting(line: DiffLine, path: string, byAnchor: Map<string, PrComment[]>): PrComment[] {
+  let res: PrComment[] = [];
+  for (const k of lineAnchorKeys(line, path)) {
+    const list = byAnchor.get(k);
+    if (list) res = res.concat(list);
+  }
+  return res;
+}
+
 /** Render an existing PR thread (one or more comments) read-only beneath its line. */
-function existingCommentBlock(diffIndex: number, comments: PrComment[]): RenderRow[] {
+function existingCommentBlock(
+  diffIndex: number,
+  comments: PrComment[],
+  tombstoned: Set<number>,
+): RenderRow[] {
   const rows: RenderRow[] = [];
+  let anyDead = false;
   comments.forEach((c, idx) => {
+    const dead = tombstoned.has(c.id);
+    if (dead) anyDead = true;
+    const tone: CommentTone = dead ? 'tombstone' : 'existing';
     rows.push({
       kind: 'comment',
       diffIndex,
-      text: `    ${idx === 0 ? '┌' : '├'} ${c.author}:`,
+      text: `    ${idx === 0 ? '┌' : '├'} ${dead ? '✗ ' : ''}${c.author}:`,
       meta: true,
-      tone: 'existing',
+      tone,
     });
     for (const b of c.body.split('\n')) {
-      rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false, tone: 'existing' });
+      rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false, tone });
     }
   });
-  rows.push({ kind: 'comment', diffIndex, text: '    └ (read-only)', meta: true, tone: 'existing' });
+  rows.push({
+    kind: 'comment',
+    diffIndex,
+    text: anyDead ? '    └ marked for deletion · d to unmark' : '    └ (read-only) · d to delete',
+    meta: true,
+    tone: anyDead ? 'tombstone' : 'existing',
+  });
   return rows;
 }
 
@@ -199,6 +238,17 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
 
   // Existing inline comments already on the PR (read-only).
   const [prComments, setPrComments] = useState<PrComment[]>([]);
+  // Ids of existing comments marked for deletion on the next submit.
+  const [tombstones, setTombstones] = useState<number[]>([]);
+
+  // Submit-review screen state.
+  const [submitView, setSubmitView] = useState(false);
+  const [verdict, setVerdict] = useState<ReviewEvent>('COMMENT');
+  const [summary, setSummary] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  // Current PR head, re-resolved when opening the submit screen, to detect drift.
+  const [currentHead, setCurrentHead] = useState<string | null>(null);
 
   // After an editor round-trip, the working-tree line we want the diff cursor
   // to land on. Read by the diff-load effect, then cleared.
@@ -226,6 +276,16 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, []);
+
+  // Re-fetch the PR's existing comments (after a submit, or on manual refresh).
+  const refreshPrComments = useCallback(() => {
+    if (pr === undefined) return;
+    void fetchPrComments(pr)
+      .then(setPrComments)
+      .catch(() => {
+        /* best-effort */
+      });
+  }, [pr]);
 
   // Initial load: resolve the repo, pick the source, then list its files.
   useEffect(() => {
@@ -331,6 +391,8 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     [prComments],
   );
 
+  const tombstoneSet = useMemo(() => new Set(tombstones), [tombstones]);
+
   // The drawn rows: each diff line, then any existing thread, then a draft.
   const renderRows = useMemo(() => {
     const rows: RenderRow[] = [];
@@ -339,19 +401,16 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       let existing: PrComment[] = [];
       let draft: DraftComment | undefined;
       if (path) {
-        for (const k of lineAnchorKeys(line, path)) {
-          const list = existingByAnchor.get(k);
-          if (list) existing = existing.concat(list);
-        }
+        existing = gatherExisting(line, path, existingByAnchor);
         const a = anchorForLine(line);
         if (a) draft = commentMap.get(anchorKey(path, a.side, a.line));
       }
       rows.push({ kind: 'diff', diffIndex: i, line, commented: existing.length > 0 || !!draft });
-      if (existing.length > 0) rows.push(...existingCommentBlock(i, existing));
+      if (existing.length > 0) rows.push(...existingCommentBlock(i, existing, tombstoneSet));
       if (draft) rows.push(...commentBlock(i, draft));
     });
     return rows;
-  }, [diffLines, commentMap, existingByAnchor, selectedFile?.path]);
+  }, [diffLines, commentMap, existingByAnchor, tombstoneSet, selectedFile?.path]);
 
   // Where the cursor's diff line sits among the rendered rows.
   const cursorRenderIndex = useMemo(
@@ -470,31 +529,173 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     setStatus(body ? 'Comment saved.' : 'Comment removed.');
   }, [source, selectedFile, diffLines, diffCursor, comments, commentMap, persist, setRawMode]);
 
-  // Delete the draft comment on the current diff line, if any.
+  // `d` deletes your draft on the line if there is one; otherwise it toggles a
+  // tombstone on the existing comment(s) there, to be deleted on submit.
   const deleteComment = useCallback(() => {
     if (source?.kind !== 'pr' || !selectedFile) return;
     const row = diffLines[diffCursor];
-    const anchor = row ? anchorForLine(row) : null;
-    if (!anchor || !commentMap.has(anchorKey(selectedFile.path, anchor.side, anchor.line))) {
+    if (!row) return;
+    const anchor = anchorForLine(row);
+
+    if (anchor && commentMap.has(anchorKey(selectedFile.path, anchor.side, anchor.line))) {
+      const next = comments.filter(
+        (c) => !(c.path === selectedFile.path && c.side === anchor.side && c.line === anchor.line),
+      );
+      setComments(next);
+      persist(next);
+      setStatus('Draft comment removed.');
+      return;
+    }
+
+    const existing = gatherExisting(row, selectedFile.path, existingByAnchor);
+    if (existing.length === 0) {
       setStatus('No comment on this line.');
       return;
     }
-    const next = comments.filter(
-      (c) => !(c.path === selectedFile.path && c.side === anchor.side && c.line === anchor.line),
+    const ids = existing.map((c) => c.id);
+    const allMarked = ids.every((id) => tombstones.includes(id));
+    setTombstones((prev) =>
+      allMarked
+        ? prev.filter((id) => !ids.includes(id))
+        : Array.from(new Set([...prev, ...ids])),
     );
-    setComments(next);
-    persist(next);
-    setStatus('Comment removed.');
-  }, [source, selectedFile, diffLines, diffCursor, comments, commentMap, persist]);
+    setStatus(
+      allMarked
+        ? 'Unmarked for deletion.'
+        : `Marked ${ids.length} comment(s) for deletion on submit.`,
+    );
+  }, [source, selectedFile, diffLines, diffCursor, comments, commentMap, existingByAnchor, tombstones, persist]);
+
+  // Open the submit-review screen and re-resolve the PR head to detect drift.
+  const openSubmitView = useCallback(() => {
+    if (source?.kind !== 'pr' || pr === undefined) {
+      setStatus('Submitting a review is only available in PR mode.');
+      return;
+    }
+    setSubmitError(null);
+    setCurrentHead(null);
+    setSubmitView(true);
+    void resolvePr(pr)
+      .then((info) => setCurrentHead(info.headRefOid))
+      .catch(() => {
+        /* drift check is best-effort */
+      });
+  }, [source, pr]);
+
+  const editSummary = useCallback(() => {
+    setRawMode(false);
+    leaveAltScreen();
+    const result = editTextInEditor(summary);
+    enterAltScreen();
+    setRawMode(true);
+    if (result.ok) setSummary((result.text ?? '').trim());
+  }, [summary, setRawMode]);
+
+  const doSubmit = useCallback(() => {
+    if (pr === undefined || !headShaRef.current) return;
+    const hasReview = comments.length > 0 || summary.trim().length > 0 || verdict !== 'COMMENT';
+    if (!hasReview && tombstones.length === 0) {
+      setSubmitError('Nothing to submit — add a comment, a summary, pick a verdict, or mark a deletion.');
+      return;
+    }
+    setSubmitting(true);
+    setSubmitError(null);
+    void (async () => {
+      // 1) Post the review (verdict + summary + new inline comments), if any.
+      if (hasReview) {
+        try {
+          await submitReview(pr, {
+            event: verdict,
+            body: summary,
+            // Anchor to the head the comments were drafted against.
+            commitId: headShaRef.current!,
+            comments: comments.map((c) => ({
+              path: c.path,
+              line: c.line,
+              side: c.side,
+              body: c.body,
+            })),
+          });
+        } catch (err) {
+          setSubmitting(false);
+          setSubmitError(`Review submit failed: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+      }
+      // 2) Delete tombstoned comments, tolerating per-comment failures.
+      const failed: number[] = [];
+      for (const id of tombstones) {
+        try {
+          await deletePrComment(id);
+        } catch {
+          failed.push(id);
+        }
+      }
+      const posted = hasReview ? comments.length : 0;
+      const deleted = tombstones.length - failed.length;
+      // 3) Reflect the new state: re-fetch existing comments, clear drafts.
+      const fresh = await fetchPrComments(pr).catch(() => [] as PrComment[]);
+      setPrComments(fresh);
+      setComments([]);
+      persist([]);
+      setTombstones(failed);
+      setSubmitting(false);
+
+      const summaryMsg =
+        `Submitted as ${verdict}` +
+        (posted ? ` · ${posted} comment(s)` : '') +
+        (deleted ? ` · ${deleted} deleted` : '');
+      if (failed.length > 0) {
+        setSubmitError(`${summaryMsg}, but ${failed.length} deletion(s) failed (not yours?).`);
+      } else {
+        setSubmitView(false);
+        setStatus(summaryMsg + '.');
+      }
+    })();
+  }, [pr, comments, summary, verdict, tombstones, persist]);
 
   useInput(
     (input, key) => {
-    if (input === 'q' || (key.ctrl && input === 'c')) {
+    if (key.ctrl && input === 'c') {
       exit();
+      return;
+    }
+
+    // Submit-review screen has its own keymap.
+    if (submitView) {
+      if (submitting) return;
+      if (key.escape || input === 'q') {
+        setSubmitView(false);
+        return;
+      }
+      if (key.downArrow || input === 'j' || key.upArrow || input === 'k') {
+        const order: ReviewEvent[] = ['COMMENT', 'APPROVE', 'REQUEST_CHANGES'];
+        const dir = key.downArrow || input === 'j' ? 1 : -1;
+        setVerdict((v) => order[(order.indexOf(v) + dir + order.length) % order.length]);
+        return;
+      }
+      if (input === 'm') {
+        editSummary();
+        return;
+      }
+      if (key.return || input === 'y') {
+        doSubmit();
+        return;
+      }
+      return;
+    }
+
+    if (input === 'q') {
+      exit();
+      return;
+    }
+    if (input === 'S') {
+      openSubmitView();
       return;
     }
     if (input === 'r') {
       void reloadFiles();
+      if (sourceRef.current?.kind === 'pr') refreshPrComments();
       return;
     }
     if (key.tab || input === 'h' || input === 'l' || key.leftArrow || key.rightArrow) {
@@ -563,6 +764,94 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         </Text>
         <Text>{error}</Text>
         <Text dimColor>Press q to quit, r to retry.</Text>
+      </Box>
+    );
+  }
+
+  if (submitView) {
+    const drift =
+      currentHead !== null && headShaRef.current !== null && currentHead !== headShaRef.current;
+    const byFile = new Map<string, DraftComment[]>();
+    for (const c of comments) {
+      const arr = byFile.get(c.path);
+      if (arr) arr.push(c);
+      else byFile.set(c.path, [c]);
+    }
+    const verdicts: { v: ReviewEvent; label: string }[] = [
+      { v: 'COMMENT', label: 'Comment — feedback without explicit approval' },
+      { v: 'APPROVE', label: 'Approve' },
+      { v: 'REQUEST_CHANGES', label: 'Request changes' },
+    ];
+    return (
+      <Box flexDirection="column" width={columns} height={rows} padding={1}>
+        <Text bold>
+          Submit review · <Text color="cyan">PR #{pr}</Text>
+        </Text>
+        {drift ? (
+          <Text color="yellow">
+            ⚠ PR head moved since you started — comments anchor to the commit you reviewed.
+          </Text>
+        ) : null}
+
+        <Box marginTop={1} flexDirection="column">
+          <Text bold>Verdict</Text>
+          {verdicts.map(({ v, label }) => (
+            <Text key={v} color={v === verdict ? 'green' : undefined}>
+              {v === verdict ? '❯ ' : '  '}
+              {label}
+            </Text>
+          ))}
+        </Box>
+
+        <Box marginTop={1} flexDirection="column">
+          <Text bold>
+            Summary <Text dimColor>(m to edit)</Text>
+          </Text>
+          {summary ? (
+            summary
+              .split('\n')
+              .slice(0, 4)
+              .map((l, i) => <Text key={i}>{l.length > 0 ? l : ' '}</Text>)
+          ) : (
+            <Text dimColor>— none —</Text>
+          )}
+        </Box>
+
+        <Box marginTop={1} flexDirection="column" flexGrow={1}>
+          <Text bold>Comments ({comments.length})</Text>
+          {comments.length === 0 ? (
+            <Text dimColor>— none —</Text>
+          ) : (
+            [...byFile.entries()].map(([path, cs]) => (
+              <Box key={path} flexDirection="column">
+                <Text color="cyan" wrap="truncate">
+                  {path}
+                </Text>
+                {cs.map((c, i) => (
+                  <Text key={i} dimColor wrap="truncate">
+                    {'  '}
+                    {c.side === 'LEFT' ? '-' : '+'}
+                    {c.line} {c.body.split('\n')[0]}
+                  </Text>
+                ))}
+              </Box>
+            ))
+          )}
+        </Box>
+
+        {tombstones.length > 0 ? (
+          <Text color="red">
+            Will delete {tombstones.length} existing comment{tombstones.length === 1 ? '' : 's'}.
+          </Text>
+        ) : null}
+        {submitError ? (
+          <Text color="red" wrap="truncate">
+            {submitError}
+          </Text>
+        ) : null}
+        <Text dimColor>
+          {submitting ? 'Submitting…' : '↑↓ verdict · m summary · enter submit · esc cancel'}
+        </Text>
       </Box>
     );
   }
@@ -647,6 +936,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
           {source?.kind === 'pr' ? (
             <Text>
               <Text color="cyan">c</Text> comment <Text color="cyan">d</Text> delete{' '}
+              <Text color="cyan">S</Text> submit{' '}
             </Text>
           ) : null}
           <Text color="cyan">r</Text> refresh <Text color="cyan">q</Text> quit

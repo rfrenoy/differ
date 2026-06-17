@@ -58,9 +58,8 @@ differ --pr 234
 
 This shells out to the [GitHub CLI](https://cli.github.com) (`gh pr diff`), so
 `gh` must be installed and authenticated (`gh auth login`). It is **fetch-only**:
-your working tree and current branch are left untouched. Editing the diff is
-disabled in this mode (code suggestions are coming), but you can browse with `o`
-and leave review comments with `c`.
+your working tree and current branch are left untouched. Browse with `o`, leave
+review comments with `c`, and propose changes with `e` (see below).
 
 ### Commenting on a PR
 
@@ -76,6 +75,23 @@ comment marks it for deletion (`✗`, in red); the deletion is applied when you
 submit. Comments whose line no longer maps to the current diff are counted as
 "outdated" in the status bar rather than shown. `r` re-fetches the PR's
 comments.
+
+### Proposing changes (code suggestions)
+
+In PR mode, press `e` to **edit the file and have your edits become GitHub code
+suggestions** — the edit-from-diff idea pointed at review. differ opens the file
+(from a temporary checkout of the PR head) in `$EDITOR`; when you save, it diffs
+your edits and turns each change into a draft:
+
+- A change that lands on a line the PR touched becomes a clickable
+  ```suggestion (multi-line edits become multi-line suggestions automatically).
+- A change **outside** the PR's diff — where GitHub can't anchor an inline
+  comment — is preserved as a code-block comment anchored to the nearest diff
+  line, noting where it really belongs (so no edit is lost).
+
+You can press `c` on a resulting suggestion to add an explanatory note above it.
+A status line summarizes what was created (e.g. `Added 2 suggestions · 1 code
+comment`). Suggestions submit with the rest of your review via `S`.
 
 ### Submitting the review
 
@@ -96,7 +112,7 @@ reviewed; if the PR head moved meanwhile, the screen warns you.
 | `Tab`, `←`/`→`   | Switch between the file list and the diff         |
 | `z`            | Widen the file pane to show full names (toggle)   |
 | `H`/`M`/`L`     | Jump to the top/middle/bottom visible diff line   |
-| `e`            | Open the current file in `$EDITOR` at the cursor line (edit) |
+| `e`            | Edit the file at the cursor line — direct edit, or in PR mode propose changes as suggestions |
 | `o`            | Open the current file read-only at the cursor line (browse)  |
 | `c`            | Write/edit a review comment on the line (PR mode) |
 | `d`            | Delete the review comment on the line (PR mode)   |

@@ -184,6 +184,11 @@ export async function fetchRef(remote: string, ref: string): Promise<void> {
   await git.fetch([remote, ref]);
 }
 
+/** Diff a file in a worktree against its HEAD (i.e. the user's just-made edits). */
+export async function diffWorktreeFile(worktreeDir: string, filePath: string): Promise<string> {
+  return simpleGit(worktreeDir).diff(['--no-color', '--', filePath]);
+}
+
 /** Remove every temp worktree we created. Synchronous, safe to call from a process-exit handler. */
 export function cleanupWorktrees(): void {
   for (const dir of tempWorktrees.splice(0)) {

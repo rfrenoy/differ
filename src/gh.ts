@@ -125,7 +125,7 @@ export interface ReviewPayload {
   body: string;
   /** The commit the comments are anchored to (what the user reviewed). */
   commitId: string;
-  comments: { path: string; line: number; side: Side; body: string }[];
+  comments: { path: string; line: number; startLine?: number; side: Side; body: string }[];
 }
 
 /** Submit a review (verdict + summary + inline comments) to the PR, atomically. */
@@ -134,12 +134,15 @@ export async function submitReview(n: number, payload: ReviewPayload): Promise<v
     commit_id: payload.commitId,
     body: payload.body,
     event: payload.event,
-    comments: payload.comments.map((c) => ({
-      path: c.path,
-      line: c.line,
-      side: c.side,
-      body: c.body,
-    })),
+    comments: payload.comments.map((c) => {
+      const o: Record<string, unknown> = { path: c.path, line: c.line, side: c.side, body: c.body };
+      // Multi-line anchor: GitHub needs start_line/start_side too.
+      if (c.startLine !== undefined && c.startLine < c.line) {
+        o.start_line = c.startLine;
+        o.start_side = c.side;
+      }
+      return o;
+    }),
   });
   await runGhInput(
     ['api', '--method', 'POST', `repos/{owner}/{repo}/pulls/${n}/reviews`, '--input', '-'],

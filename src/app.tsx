@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdin, useStdout } from 'ink';
-import { type ChangedFile, type Repo, gitDir, resolveCommit, resolveRepo } from './git.js';
+import {
+  type ChangedFile,
+  type Repo,
+  diffWorktreeFile,
+  gitDir,
+  resolveCommit,
+  resolveRepo,
+} from './git.js';
 import {
   type PrComment,
   type ReviewEvent,
@@ -18,9 +25,11 @@ import {
   type Side,
   anchorKey,
   draftsPath,
+  isSuggestion,
   loadDrafts,
   saveDrafts,
 } from './comments.js';
+import { deriveSuggestions } from './suggest.js';
 import { join } from 'node:path';
 import { enterAltScreen, leaveAltScreen } from './screen.js';
 
@@ -164,7 +173,21 @@ function lineAnchorKeys(line: DiffLine, path: string): string[] {
 
 /** Render a draft comment as indented lines beneath its diff line. */
 function commentBlock(diffIndex: number, c: DraftComment): RenderRow[] {
-  const lines = ['    ┌ you (draft)', ...c.body.split('\n').map((b) => `    │ ${b}`), '    └ c edit · d delete'];
+  // A pure suggestion renders as its proposed replacement (fence stripped, lines
+  // shown as additions); anything else (incl. prose+suggestion) renders verbatim.
+  const pure = c.body.startsWith('```suggestion') && c.body.endsWith('```');
+  let bodyLines: string[];
+  let label: string | null = null;
+  if (pure) {
+    const inner = c.body.slice('```suggestion'.length).replace(/^\n/, '').replace(/\n?```$/, '');
+    bodyLines = inner.length === 0 ? ['(removes the line)'] : inner.split('\n').map((l) => `+ ${l}`);
+    label = 'suggestion';
+  } else {
+    bodyLines = c.body.split('\n');
+    if (isSuggestion(c.body)) label = 'suggestion';
+  }
+  const header = `    ┌ you (draft${label ? ` · ${label}` : ''})`;
+  const lines = [header, ...bodyLines.map((b) => `    │ ${b}`), '    └ c edit · d delete'];
   return lines.map((text, j) => ({
     key: `dr-${diffIndex}-${j}`,
     kind: 'comment' as const,
@@ -593,6 +616,77 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     );
   }, [source, selectedFile, diffLines, diffCursor, comments, commentMap, existingByAnchor, tombstones, persist]);
 
+  // PR mode `e`: edit the file (in the PR-head worktree), then turn the edits
+  // into draft suggestions — clickable where they land on the diff, code-block
+  // comments anchored nearby where they don't.
+  const editToSuggest = useCallback(() => {
+    if (source?.kind !== 'pr' || !selectedFile) return;
+    const file = selectedFile;
+    const startAt = newLineAt(diffLines, diffCursor);
+    const validRight = new Set<number>();
+    for (const dl of diffLines) {
+      if ((dl.type === 'add' || dl.type === 'context') && dl.newLine !== undefined) {
+        validRight.add(dl.newLine);
+      }
+    }
+    void (async () => {
+      let dir: string;
+      try {
+        setStatus('Preparing edit…');
+        dir = await source.contextRoot();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      setRawMode(false);
+      leaveAltScreen();
+      const res = openInEditor(join(dir, file.path), startAt, dir);
+      enterAltScreen();
+      setRawMode(true);
+      if (!res.ok) {
+        setError(res.error ?? 'Editor failed.');
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await diffWorktreeFile(dir, file.path);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      if (!raw.trim()) {
+        setStatus('No changes made.');
+        return;
+      }
+      const derived = deriveSuggestions(raw, validRight);
+      if (derived.length === 0) {
+        setStatus('No suggestible changes found.');
+        return;
+      }
+      let next = comments.slice();
+      for (const d of derived) {
+        next = next.filter((c) => !(c.path === file.path && c.side === d.side && c.line === d.line));
+        next.push({
+          path: file.path,
+          side: d.side,
+          line: d.line,
+          startLine: d.startLine,
+          body: d.body,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      setComments(next);
+      persist(next);
+      const sug = derived.filter((d) => d.kind === 'suggestion').length;
+      const cc = derived.length - sug;
+      setStatus(
+        `Added ${sug} suggestion${sug === 1 ? '' : 's'}` +
+          (cc ? ` · ${cc} code comment${cc === 1 ? '' : 's'}` : '') +
+          '.',
+      );
+    })();
+  }, [source, selectedFile, diffLines, diffCursor, comments, persist, setRawMode]);
+
   // Open the submit-review screen and re-resolve the PR head to detect drift.
   const openSubmitView = useCallback(() => {
     if (source?.kind !== 'pr' || pr === undefined) {
@@ -639,6 +733,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
             comments: comments.map((c) => ({
               path: c.path,
               line: c.line,
+              startLine: c.startLine,
               side: c.side,
               body: c.body,
             })),
@@ -734,10 +829,11 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       return;
     }
     if (input === 'e') {
-      if (!source?.editable) {
-        setStatus('Editing is off while viewing a PR — code suggestions are coming.');
+      if (source?.kind === 'pr') {
+        editToSuggest();
         return;
       }
+      if (!source?.editable) return;
       openEditor();
       return;
     }
@@ -979,6 +1075,11 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
           {source?.editable ? (
             <Text>
               <Text color="cyan">e</Text> edit@line{' '}
+            </Text>
+          ) : null}
+          {source?.kind === 'pr' ? (
+            <Text>
+              <Text color="cyan">e</Text> suggest{' '}
             </Text>
           ) : null}
           <Text color="cyan">o</Text> view{' '}

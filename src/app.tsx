@@ -127,9 +127,10 @@ function CommentRow({ text, meta, tone }: { text: string; meta: boolean; tone: C
  * What actually gets drawn in the diff pane: each diff line, optionally
  * followed by the rendered lines of comments anchored to it.
  */
-type RenderRow =
+type RenderRow = { key: string } & (
   | { kind: 'diff'; diffIndex: number; line: DiffLine; commented: boolean }
-  | { kind: 'comment'; diffIndex: number; text: string; meta: boolean; tone: CommentTone };
+  | { kind: 'comment'; diffIndex: number; text: string; meta: boolean; tone: CommentTone }
+);
 
 /** The anchor (side + file line) for a *new draft* on a diff row, if any. */
 function anchorForLine(line: DiffLine): { side: Side; line: number } | null {
@@ -159,14 +160,15 @@ function lineAnchorKeys(line: DiffLine, path: string): string[] {
 
 /** Render a draft comment as indented lines beneath its diff line. */
 function commentBlock(diffIndex: number, c: DraftComment): RenderRow[] {
-  const rows: RenderRow[] = [
-    { kind: 'comment', diffIndex, text: '    ┌ you (draft)', meta: true, tone: 'draft' },
-  ];
-  for (const b of c.body.split('\n')) {
-    rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false, tone: 'draft' });
-  }
-  rows.push({ kind: 'comment', diffIndex, text: '    └ c edit · d delete', meta: true, tone: 'draft' });
-  return rows;
+  const lines = ['    ┌ you (draft)', ...c.body.split('\n').map((b) => `    │ ${b}`), '    └ c edit · d delete'];
+  return lines.map((text, j) => ({
+    key: `dr-${diffIndex}-${j}`,
+    kind: 'comment' as const,
+    diffIndex,
+    text,
+    meta: j === 0 || j === lines.length - 1,
+    tone: 'draft' as const,
+  }));
 }
 
 /** Existing PR comments anchored to a diff line, gathered across its anchor keys. */
@@ -187,28 +189,20 @@ function existingCommentBlock(
 ): RenderRow[] {
   const rows: RenderRow[] = [];
   let anyDead = false;
+  const push = (text: string, meta: boolean, tone: CommentTone) =>
+    rows.push({ key: `ex-${diffIndex}-${rows.length}`, kind: 'comment', diffIndex, text, meta, tone });
   comments.forEach((c, idx) => {
     const dead = tombstoned.has(c.id);
     if (dead) anyDead = true;
     const tone: CommentTone = dead ? 'tombstone' : 'existing';
-    rows.push({
-      kind: 'comment',
-      diffIndex,
-      text: `    ${idx === 0 ? '┌' : '├'} ${dead ? '✗ ' : ''}${c.author}:`,
-      meta: true,
-      tone,
-    });
-    for (const b of c.body.split('\n')) {
-      rows.push({ kind: 'comment', diffIndex, text: `    │ ${b}`, meta: false, tone });
-    }
+    push(`    ${idx === 0 ? '┌' : '├'} ${dead ? '✗ ' : ''}${c.author}:`, true, tone);
+    for (const b of c.body.split('\n')) push(`    │ ${b}`, false, tone);
   });
-  rows.push({
-    kind: 'comment',
-    diffIndex,
-    text: anyDead ? '    └ marked for deletion · d to unmark' : '    └ (read-only) · d to delete',
-    meta: true,
-    tone: anyDead ? 'tombstone' : 'existing',
-  });
+  push(
+    anyDead ? '    └ marked for deletion · d to unmark' : '    └ (read-only) · d to delete',
+    true,
+    anyDead ? 'tombstone' : 'existing',
+  );
   return rows;
 }
 
@@ -231,7 +225,9 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
   const [diffLines, setDiffLines] = useState<DiffLine[]>([]);
   const [diffCursor, setDiffCursor] = useState(0);
   // Scroll offset into the rendered rows (diff lines + inline comment blocks).
-  const [renderTop, setRenderTop] = useState(0);
+  // A ref, not state: it's clamped during render to keep the cursor visible, so
+  // moving past the viewport edge needs no extra render (which would flicker).
+  const renderTopRef = useRef(0);
 
   // Draft review comments (PR mode), persisted to .git/differ/pr-<n>.json.
   const [comments, setComments] = useState<DraftComment[]>([]);
@@ -349,7 +345,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         const pending = pendingCursorLine.current;
         pendingCursorLine.current = null;
         setDiffCursor(pending === null ? 0 : rowForNewLine(lines, pending));
-        setRenderTop(0);
+        renderTopRef.current = 0;
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       }
@@ -422,7 +418,13 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
         const a = anchorForLine(line);
         if (a) draft = commentMap.get(anchorKey(path, a.side, a.line));
       }
-      rows.push({ kind: 'diff', diffIndex: i, line, commented: existing.length > 0 || !!draft });
+      rows.push({
+        key: `d-${i}`,
+        kind: 'diff',
+        diffIndex: i,
+        line,
+        commented: existing.length > 0 || !!draft,
+      });
       if (existing.length > 0) rows.push(...existingCommentBlock(i, existing, tombstoneSet));
       if (draft) rows.push(...commentBlock(i, draft));
     });
@@ -435,18 +437,17 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     [renderRows, diffCursor],
   );
 
-  // Keep the cursor's rendered row inside the visible viewport.
-  useEffect(() => {
-    if (cursorRenderIndex < 0) return;
-    if (cursorRenderIndex < renderTop) setRenderTop(cursorRenderIndex);
-    else if (cursorRenderIndex >= renderTop + diffViewport)
-      setRenderTop(cursorRenderIndex - diffViewport + 1);
-  }, [cursorRenderIndex, renderTop, diffViewport]);
-
-  const visibleRows = useMemo(
-    () => renderRows.slice(renderTop, renderTop + diffViewport),
-    [renderRows, renderTop, diffViewport],
-  );
+  // Clamp the scroll offset during render so the cursor stays visible. Writing
+  // the ref here (no setState) means a move past the edge scrolls within the
+  // same frame — no second render, no flicker.
+  let viewTop = renderTopRef.current;
+  if (cursorRenderIndex >= 0) {
+    if (cursorRenderIndex < viewTop) viewTop = cursorRenderIndex;
+    else if (cursorRenderIndex >= viewTop + diffViewport) viewTop = cursorRenderIndex - diffViewport + 1;
+  }
+  viewTop = Math.max(0, viewTop);
+  renderTopRef.current = viewTop;
+  const visibleRows = renderRows.slice(viewTop, viewTop + diffViewport);
 
   const openEditor = useCallback(() => {
     if (!repo || !selectedFile) return;
@@ -928,12 +929,12 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
           {visibleRows.length === 0 ? (
             <Text dimColor>{selectedFile ? '(no diff)' : 'Select a file'}</Text>
           ) : (
-            visibleRows.map((row, i) =>
+            visibleRows.map((row) =>
               row.kind === 'comment' ? (
-                <CommentRow key={renderTop + i} text={row.text} meta={row.meta} tone={row.tone} />
+                <CommentRow key={row.key} text={row.text} meta={row.meta} tone={row.tone} />
               ) : (
                 <DiffRow
-                  key={renderTop + i}
+                  key={row.key}
                   line={row.line}
                   selected={pane === 'diff' && row.diffIndex === diffCursor}
                   gutter={source?.kind === 'pr' ? (row.commented ? '● ' : '  ') : undefined}

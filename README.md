@@ -104,6 +104,34 @@ comments stay visible (now read-only) and deleted ones disappear — no restart.
 Local drafts are cleared on success. Comments are anchored to the commit you
 reviewed; if the PR head moved meanwhile, the screen warns you.
 
+### Scripting: draft comments from the CLI
+
+differ can create draft comments without the TUI, so another tool — e.g. a
+model reviewing a PR — can propose comments that you then curate and submit
+interactively. Both commands require `--pr`.
+
+```bash
+# Add draft comments from a JSON array on stdin
+differ --pr 234 add-comments <<'JSON'
+[
+  { "path": "src/auth.ts", "line": 42, "body": "[GEN6] use a switch + assertNever" },
+  { "path": "src/auth.ts", "line": 88, "suggestion": "return check(user, opts)" },
+  { "path": "src/db.ts", "line": 20, "startLine": 18, "body": "covers lines 18-20" }
+]
+JSON
+
+# Print the current drafts as JSON
+differ --pr 234 list-comments
+```
+
+Each finding takes `path` and `line` (plus optional `side` — defaults to
+`RIGHT` —, `startLine` for a multi-line anchor, `body`, and `suggestion`, which
+is wrapped in a ```suggestion block). differ validates every anchor against the
+PR's diff and **rejects** any that aren't on a diff line (reporting why), so the
+model gets immediate feedback instead of a failure at submit time. Drafts land
+in the same `.git/differ/pr-<n>.json` the TUI reads — open `differ --pr 234` to
+review, edit, and submit them.
+
 ## Keys
 
 | Key            | Action                                            |

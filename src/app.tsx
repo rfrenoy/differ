@@ -22,7 +22,6 @@ import { type DiffLine, newLineAt, parseDiff, rowForNewLine } from './diff.js';
 import { editTextInEditor, openInEditor, viewInEditor } from './editor.js';
 import {
   type DraftComment,
-  type Side,
   anchorKey,
   draftsPath,
   isSuggestion,
@@ -30,6 +29,7 @@ import {
   saveDrafts,
 } from './comments.js';
 import { deriveSuggestions } from './suggest.js';
+import { anchorForLine, lineAnchorKeys } from './anchor.js';
 import { join } from 'node:path';
 import { enterAltScreen, leaveAltScreen } from './screen.js';
 
@@ -144,32 +144,6 @@ type RenderRow = { key: string } & (
   | { kind: 'diff'; diffIndex: number; line: DiffLine; commented: boolean }
   | { kind: 'comment'; diffIndex: number; text: string; meta: boolean; tone: CommentTone }
 );
-
-/** The anchor (side + file line) for a *new draft* on a diff row, if any. */
-function anchorForLine(line: DiffLine): { side: Side; line: number } | null {
-  if (line.type === 'del') {
-    return line.oldLine === undefined ? null : { side: 'LEFT', line: line.oldLine };
-  }
-  if (line.type === 'add' || line.type === 'context') {
-    return line.newLine === undefined ? null : { side: 'RIGHT', line: line.newLine };
-  }
-  return null;
-}
-
-/**
- * Every anchor key a diff row can carry. Context lines exist on both sides, so
- * they can hold a comment keyed to either the old (LEFT) or new (RIGHT) line.
- */
-function lineAnchorKeys(line: DiffLine, path: string): string[] {
-  const keys: string[] = [];
-  if (line.type === 'del' && line.oldLine !== undefined) keys.push(anchorKey(path, 'LEFT', line.oldLine));
-  if (line.type === 'add' && line.newLine !== undefined) keys.push(anchorKey(path, 'RIGHT', line.newLine));
-  if (line.type === 'context') {
-    if (line.newLine !== undefined) keys.push(anchorKey(path, 'RIGHT', line.newLine));
-    if (line.oldLine !== undefined) keys.push(anchorKey(path, 'LEFT', line.oldLine));
-  }
-  return keys;
-}
 
 /** Render a draft comment as indented lines beneath its diff line. */
 function commentBlock(diffIndex: number, c: DraftComment): RenderRow[] {

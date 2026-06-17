@@ -225,6 +225,8 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
   const [files, setFiles] = useState<ChangedFile[]>([]);
   const [fileIdx, setFileIdx] = useState(0);
   const [pane, setPane] = useState<Pane>('files');
+  // When true, widen the file pane to show full file names.
+  const [filesExpanded, setFilesExpanded] = useState(false);
 
   const [diffLines, setDiffLines] = useState<DiffLine[]>([]);
   const [diffCursor, setDiffCursor] = useState(0);
@@ -364,12 +366,27 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     return m;
   }, [comments]);
 
-  // Per-file draft-comment counts, for the file-list badges.
-  const commentCounts = useMemo(() => {
+  // Per-file message counts for the file-list badges: existing PR comments plus
+  // your drafts (drafts/PR comments only exist in PR mode, so 0 elsewhere).
+  const fileCommentCounts = useMemo(() => {
     const m = new Map<string, number>();
     for (const c of comments) m.set(c.path, (m.get(c.path) ?? 0) + 1);
+    for (const c of prComments) m.set(c.path, (m.get(c.path) ?? 0) + 1);
     return m;
-  }, [comments]);
+  }, [comments, prComments]);
+
+  // File-pane width: a fixed sidebar, or — when expanded — wide enough to show
+  // the longest file name (with marker + badge), capped at 80% of the terminal.
+  const fileColWidth = useMemo(() => {
+    if (!filesExpanded) return FILE_COL_WIDTH;
+    let longest = 0;
+    for (const f of files) {
+      const badge = (fileCommentCounts.get(f.path) ?? 0) > 0 ? 5 : 0; // " ●NN"
+      longest = Math.max(longest, f.code.length + 1 + f.path.length + badge);
+    }
+    const want = longest + 4; // round borders (2) + paddingX (2)
+    return Math.max(FILE_COL_WIDTH, Math.min(want, Math.floor(columns * 0.85)));
+  }, [filesExpanded, files, fileCommentCounts, columns]);
 
   // Existing PR comments, grouped by anchor (skipping outdated ones).
   const existingByAnchor = useMemo(() => {
@@ -702,6 +719,10 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       setPane((p) => (p === 'files' ? 'diff' : 'files'));
       return;
     }
+    if (input === 'z') {
+      setFilesExpanded((v) => !v);
+      return;
+    }
     if (input === 'e') {
       if (!source?.editable) {
         setStatus('Editing is off while viewing a PR — code suggestions are coming.');
@@ -870,7 +891,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       <Box height={bodyHeight}>
         <Box
           flexDirection="column"
-          width={FILE_COL_WIDTH}
+          width={fileColWidth}
           flexShrink={0}
           borderStyle="round"
           borderColor={pane === 'files' ? 'blue' : 'gray'}
@@ -888,7 +909,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
                   file={f}
                   active={pane === 'files'}
                   selected={i === fileIdx}
-                  comments={commentCounts.get(f.path) ?? 0}
+                  comments={fileCommentCounts.get(f.path) ?? 0}
                 />
               ))
           )}
@@ -927,6 +948,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       <Box>
         <Text>
           <Text color="cyan">↑↓/jk</Text> move <Text color="cyan">tab</Text> pane{' '}
+          <Text color="cyan">z</Text> {filesExpanded ? 'shrink' : 'widen'}{' '}
           {source?.editable ? (
             <Text>
               <Text color="cyan">e</Text> edit@line{' '}

@@ -94,6 +94,7 @@ reviewed; if the PR head moved meanwhile, the screen warns you.
 | -------------- | ------------------------------------------------- |
 | `↑`/`↓`, `j`/`k` | Move within the active pane                       |
 | `Tab`, `←`/`→`   | Switch between the file list and the diff         |
+| `z`            | Widen the file pane to show full names (toggle)   |
 | `e`            | Open the current file in `$EDITOR` at the cursor line (edit) |
 | `o`            | Open the current file read-only at the cursor line (browse)  |
 | `c`            | Write/edit a review comment on the line (PR mode) |

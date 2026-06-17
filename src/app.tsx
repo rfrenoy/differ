@@ -443,6 +443,34 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
     [renderRows, diffCursor],
   );
 
+  // Diff-line indices that carry a comment (existing or draft), ascending —
+  // for jumping between comments with n/N.
+  const commentedIndices = useMemo(
+    () =>
+      renderRows.filter((r) => r.kind === 'diff' && r.commented).map((r) => r.diffIndex as number),
+    [renderRows],
+  );
+
+  // Move the cursor to the next/previous commented line (wrapping), focusing the
+  // diff pane so the move is visible.
+  const jumpToComment = useCallback(
+    (dir: 1 | -1) => {
+      if (commentedIndices.length === 0) {
+        setStatus('No comments in this file.');
+        return;
+      }
+      setPane('diff');
+      setDiffCursor((cur) => {
+        if (dir === 1) {
+          return commentedIndices.find((i) => i > cur) ?? commentedIndices[0];
+        }
+        const before = commentedIndices.filter((i) => i < cur);
+        return before.length > 0 ? before[before.length - 1] : commentedIndices[commentedIndices.length - 1];
+      });
+    },
+    [commentedIndices],
+  );
+
   // Clamp the scroll offset during render so the cursor stays visible. Writing
   // the ref here (no setState) means a move past the edge scrolls within the
   // same frame — no second render, no flicker.
@@ -823,6 +851,10 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
       deleteComment();
       return;
     }
+    if ((input === 'n' || input === 'N') && source?.kind === 'pr') {
+      jumpToComment(input === 'n' ? 1 : -1);
+      return;
+    }
 
     // H/M/L: jump the cursor to the top/middle/bottom visible diff line (vim
     // screen motions), within the current viewport — no scrolling.
@@ -1060,7 +1092,7 @@ export default function App({ target, pr }: { target?: string; pr?: number }) {
           {source?.kind === 'pr' ? (
             <Text>
               <Text color="cyan">c</Text> comment <Text color="cyan">d</Text> delete{' '}
-              <Text color="cyan">S</Text> submit{' '}
+              <Text color="cyan">n/N</Text> next/prev <Text color="cyan">S</Text> submit{' '}
             </Text>
           ) : null}
           <Text color="cyan">r</Text> refresh <Text color="cyan">q</Text> quit

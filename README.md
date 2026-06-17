@@ -142,6 +142,7 @@ review, edit, and submit them.
 | `H`/`M`/`L`     | Jump to the top/middle/bottom visible diff line   |
 | `e`            | Edit the file at the cursor line — direct edit, or in PR mode propose changes as suggestions |
 | `o`            | Open the current file read-only at the cursor line (browse)  |
+| `n`/`N`         | Jump to the next/previous commented line (PR mode) |
 | `c`            | Write/edit a review comment on the line (PR mode) |
 | `d`            | Delete the review comment on the line (PR mode)   |
 | `S`            | Submit the review to GitHub (PR mode)             |
